@@ -1,0 +1,9 @@
+[mod]
+
+name="Bo's War"
+id="bos-war"
+version="0.0.1"
+
+[autoload]
+EnemyAIConfig="res://BosWar/Config.gd"
+EnemyAIMain="res://BosWar/Main.gd"
