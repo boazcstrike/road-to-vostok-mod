@@ -164,7 +164,12 @@ func SpawnWanderer():
 
 
         newAgent.ActivateWanderer()
-        activeAgents += 1
+        if is_instance_valid(newAgent):
+            var before = activeAgents
+            activeAgents += 1
+            DebugUtils._debug_log("Spawn increment (Wanderer): before=%d after=%d" % [before, activeAgents])
+        else:
+            DebugUtils._debug_log("Spawn failed (Wanderer): agent invalid after activation")
         print("AI Spawner: Agent active (Wanderer)")
     else:
         print("AI Spawner: No valid spawn points (Wanderer)")
@@ -190,7 +195,12 @@ func SpawnGuard():
 
 
         newAgent.ActivateGuard()
-        activeAgents += 1
+        if is_instance_valid(newAgent):
+            var before = activeAgents
+            activeAgents += 1
+            DebugUtils._debug_log("Spawn increment (Guard): before=%d after=%d" % [before, activeAgents])
+        else:
+            DebugUtils._debug_log("Spawn failed (Guard): agent invalid after activation")
         print("AI Spawner: Agent active (Guard)")
     else:
         print("AI Spawner: No valid patrol points (Guard)")
@@ -214,7 +224,12 @@ func SpawnHider():
 
 
     newAgent.ActivateHider()
-    activeAgents += 1
+    if is_instance_valid(newAgent):
+        var before = activeAgents
+        activeAgents += 1
+        DebugUtils._debug_log("Spawn increment (Hider): before=%d after=%d" % [before, activeAgents])
+    else:
+        DebugUtils._debug_log("Spawn failed (Hider): agent invalid after activation")
     print("Hider spawned")
 
 func SpawnMinion(spawnPosition):
@@ -233,7 +248,12 @@ func SpawnMinion(spawnPosition):
 
 
     newAgent.ActivateMinion()
-    activeAgents += 1
+    if is_instance_valid(newAgent):
+        var before = activeAgents
+        activeAgents += 1
+        DebugUtils._debug_log("Spawn increment (Minion): before=%d after=%d" % [before, activeAgents])
+    else:
+        DebugUtils._debug_log("Spawn failed (Minion): agent invalid after activation")
     print("AI Spawner: Agent active (Minion)")
 
 func SpawnBoss(spawnPosition):
@@ -252,7 +272,12 @@ func SpawnBoss(spawnPosition):
 
 
     newBoss.ActivateBoss()
-    activeAgents += 1
+    if is_instance_valid(newBoss):
+        var before = activeAgents
+        activeAgents += 1
+        DebugUtils._debug_log("Spawn increment (Boss): before=%d after=%d" % [before, activeAgents])
+    else:
+        DebugUtils._debug_log("Spawn failed (Boss): agent invalid after activation")
     print("AI Spawner: Agent active (Boss)")
 
 func CreateHotspot(location: Vector3, relay: bool):

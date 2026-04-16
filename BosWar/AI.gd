@@ -45,7 +45,8 @@ const AI_GUNSHOT_MEMORY_TIME = 1.25
 var current_target_type = "none"  # "player", "ai", or "none"
 var current_target_score = 0.0
 var current_target_quality = QualityTier.SECOND_HAND
-var lastKnownLocation = {"position": Vector3.ZERO, "timestamp": 0.0, "quality": QualityTier.SECOND_HAND}
+var _last_known_location_data = {"position": Vector3.ZERO, "timestamp": 0.0, "quality": QualityTier.SECOND_HAND}
+lastKnownLocation = Vector3.ZERO
 var is_close_visual_target: bool = false
 
 func Activate():
@@ -81,7 +82,9 @@ func Sensor(delta):
             _update_target_visibility()
 
             if !player_detected and _has_valid_ai_target() and currentAITargetVisible:
-                lastKnownLocation = {"position": _get_ai_target_position(), "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
+            _last_known_location_data = {"position": _get_ai_target_position(), "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
+            lastKnownLocation = _last_known_location_data.position
+                lastKnownLocation = _last_known_location_data.position
 
                 if currentState == State.Wander or currentState == State.Guard or currentState == State.Patrol:
                     Decision()
@@ -111,7 +114,8 @@ func LOSCheck(target: Vector3):
     LOS.force_raycast_update()
 
     if LOS.is_colliding() and LOS.get_collider().is_in_group("Player"):
-        lastKnownLocation = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
+        _last_known_location_data = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
+        lastKnownLocation = playerPosition
         playerVisible = true
         if playerDistance3D < 25:
             is_close_visual_target = true
@@ -131,7 +135,7 @@ func Hearing():
 
     if (playerDistance3D < run_distance and gameData.isRunning) or (playerDistance3D < walk_distance and gameData.isWalking):
         if currentState != State.Ambush:
-            lastKnownLocation = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.AUDIO}
+            _last_known_location_data = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.AUDIO}
             var audio_type = "audio_player"
             if gameData.isRunning and playerDistance3D < run_distance:
                 audio_type = "audio_player_running"
@@ -149,14 +153,16 @@ func FireDetection(delta):
 
     if gameData.isFiring and !playerVisible:
         if fireVector > 0.95:
-            lastKnownLocation = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.AUDIO}
+            _last_known_location_data = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.AUDIO}
+            lastKnownLocation = playerPosition
             _broadcast_target_to_teammates(playerPosition, "audio_player_gunshot", null, QualityTier.AUDIO)
 
             fireDetected = true
             extraVisibility = 50.0 * max(0.25, EnemyAISettings.ai_sight_multiplier)
         elif playerDistance3D < local_alert_distance:
             if currentState != State.Ambush:
-                lastKnownLocation = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.AUDIO}
+                _last_known_location_data = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.AUDIO}
+                lastKnownLocation = playerPosition
                 _broadcast_target_to_teammates(playerPosition, "audio_player_gunshot", null, QualityTier.AUDIO)
 
             fireDetected = true
@@ -291,7 +297,7 @@ func Fire(delta):
     if impact or _player_only_combat_blocked():
         return
 
-    if !_is_last_known_location_valid() or lastKnownLocation.position.distance_to(_get_engagement_position()) > 4.0:
+    if !_is_last_known_location_valid() or _last_known_location_data.position.distance_to(_get_engagement_position()) > 4.0:
         return
 
     if weaponData.weaponAction == "Semi-Auto":
@@ -524,11 +530,11 @@ func GetShiftWaypoint():
 
 func GetHuntWaypoint():
     if _is_last_known_location_valid():
-        MoveToPoint(lastKnownLocation.position)
+        MoveToPoint(_last_known_location_data.position)
 
 func GetAttackWaypoint():
     if _is_last_known_location_valid():
-        MoveToPoint(lastKnownLocation.position)
+        MoveToPoint(_last_known_location_data.position)
 
 func ChangeState(state):
     super(state)
@@ -583,13 +589,18 @@ func _get_tactics_cycle_scale() -> float:
 func _is_last_known_location_valid() -> bool:
     var now = Time.get_ticks_msec() / 1000.0
     var decay_time = TARGET_INFO_DECAY_TIME
-    if lastKnownLocation.has("quality") and lastKnownLocation.quality == QualityTier.SECOND_HAND:
+    if _last_known_location_data.has("quality") and _last_known_location_data.quality == QualityTier.SECOND_HAND:
         decay_time = SECOND_HAND_VALIDITY_TIME
-    return now - lastKnownLocation.timestamp <= decay_time
+    return now - _last_known_location_data.timestamp <= decay_time
 
 func Death(direction, force):
     DebugUtils._debug_log("Death faction=%s target=%s" % [_self_faction(), targetLabel])
     super(direction, force)
+    if is_instance_valid(AISpawner):
+        var before = AISpawner.activeAgents
+        if AISpawner.activeAgents > 0:
+            AISpawner.activeAgents -= 1
+        DebugUtils._debug_log("Death decrement: faction=%s, activeAgents before=%d after=%d" % [_self_faction(), before, AISpawner.activeAgents])
     if is_instance_valid(AISpawner) and AISpawner.has_method("replenish_regular_pool") and !boss:
         AISpawner.replenish_regular_pool(_self_faction())
     _clear_ai_target()
@@ -821,7 +832,8 @@ func _sense_ai_audio():
     _broadcast_target_to_teammates(_get_ai_target_position(audible_target), audio_type, audible_target, QualityTier.AUDIO)
     currentAITargetDistance = global_position.distance_to(audible_target.global_position)
     currentAITargetVisible = false
-    lastKnownLocation = {"position": _get_ai_target_position(audible_target), "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.AUDIO}
+    _last_known_location_data = {"position": _get_ai_target_position(audible_target), "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.AUDIO}
+    lastKnownLocation = _last_known_location_data.position
 
     if reason == "":
         reason = "AI sound"
@@ -951,7 +963,8 @@ func _acquire_best_target():
         current_target_type = "player"
         current_target_quality = QualityTier.VISUAL
         playerVisible = true
-        lastKnownLocation = {"position": best_candidate.position, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
+        _last_known_location_data = {"position": best_candidate.position, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
+        lastKnownLocation = best_candidate.position
         targetLabel = "Player %.1fm %s" % [best_candidate.distance, _quality_tier_to_string(QualityTier.VISUAL)]
         DebugUtils._debug_log("AI %s: Acquired PLAYER target (dist=%.1f score=%.3f)" % [_self_faction(), best_candidate.distance, best_score])
         _broadcast_target_to_teammates(best_candidate.position, best_candidate.type, null, QualityTier.VISUAL)
@@ -1039,7 +1052,7 @@ func _update_target_visibility():
         previousAITargetVisible = currentAITargetVisible
 
         if currentAITargetVisible:
-            lastKnownLocation = {"position": _get_ai_target_position(), "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
+            _last_known_location_data = {"position": _get_ai_target_position(), "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
             if current_target_quality > QualityTier.VISUAL:
                 current_target_quality = QualityTier.VISUAL
                 _set_target_label()
@@ -1174,7 +1187,7 @@ func _is_ai_root_hit(hitCollider) -> bool:
 
 func _get_engagement_position() -> Vector3:
     if current_target_type == "player":
-        return lastKnownLocation.position if _is_last_known_location_valid() else playerPosition
+        return _last_known_location_data.position if _is_last_known_location_valid() else playerPosition
     elif _has_valid_ai_target():
         return _get_ai_target_position()
     return playerPosition
@@ -1362,7 +1375,8 @@ func _broadcast_target_to_teammates(target_position: Vector3, target_type: Strin
 
 func _receive_teammate_target_info(target_position: Vector3, target_type: String, target_node: Node3D = null, quality: QualityTier = QualityTier.AUDIO):
     # Update lastKnownLocation
-    lastKnownLocation = {"position": target_position, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": quality}
+    _last_known_location_data = {"position": target_position, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": quality}
+    lastKnownLocation = target_position
 
     # Validate target before adopting
     if not _is_valid_teammate_target(target_position, target_type, target_node):

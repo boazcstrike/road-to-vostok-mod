@@ -23,10 +23,50 @@ const SPAWN_AUDIT_RAY_BELOW = 20.0
 const SPAWN_AUDIT_BELOW_FLOOR_THRESHOLD = 2.5
 const SPAWN_AUDIT_ABOVE_FLOOR_THRESHOLD = 6.0
 
+func _is_spawn_point_valid(spawn_point: Node3D) -> bool:
+    var origin = spawn_point.global_position + Vector3(0, SPAWN_AUDIT_RAY_ABOVE, 0)
+    var destination = spawn_point.global_position + Vector3(0, -SPAWN_AUDIT_RAY_BELOW, 0)
+    var query = PhysicsRayQueryParameters3D.create(origin, destination)
+    query.exclude = [spawn_point]
+
+    var result = get_world_3d().direct_space_state.intersect_ray(query)
+    if result.is_empty():
+        DebugUtils._debug_log("Spawn point '%s' invalid: no floor detected at position %s" % [spawn_point.name, str(spawn_point.global_position)])
+        return false
+
+    var floor_y = float(result.position.y)
+    var delta_y = floor_y - spawn_point.global_position.y
+
+    if delta_y > SPAWN_AUDIT_BELOW_FLOOR_THRESHOLD:
+        DebugUtils._debug_log("Spawn point '%s' invalid: below floor surface (delta_y=%.2f) at position %s" % [spawn_point.name, delta_y, str(spawn_point.global_position)])
+        return false
+
+    if delta_y < -SPAWN_AUDIT_ABOVE_FLOOR_THRESHOLD:
+        DebugUtils._debug_log("Spawn point '%s' invalid: floating above floor (delta_y=%.2f) at position %s" % [spawn_point.name, delta_y, str(spawn_point.global_position)])
+        return false
+
+    return true
+
+func _get_valid_spawn_points() -> Array:
+    var valid_points = []
+    for spawn_point in spawns:
+        var distance_to_player = spawn_point.global_position.distance_to(gameData.playerPosition)
+        if distance_to_player <= spawnDistance:
+            continue
+        if not _is_spawn_point_valid(spawn_point):
+            continue
+        if EnemyAISettings.enable_team_spawning and occupied_spawn_points.has(spawn_point):
+            continue
+        valid_points.append(spawn_point)
+    return valid_points
+
 
 func _ready():
     GetPoints()
     HidePoints()
+
+    var valid_count = _get_valid_spawn_points().size()
+    DebugUtils._debug_log("Valid spawn points: %d/%d" % [valid_count, spawns.size()])
 
     active = true
     spawnDistance = EnemyAISettings.spawn_distance
@@ -54,7 +94,10 @@ func _ready():
     DebugUtils._debug_log("Selected faction pool for zone '%s': %s" % [_zone_name(), currentFactionName])
 
     CreatePools()
-    _spawn_initial_population(_get_initial_population())
+
+    var initial_count = _get_initial_population()
+    DebugUtils._debug_log("Initial population: %d agents (spawn limit: %d)" % [initial_count, spawnLimit])
+    _spawn_initial_population(initial_count)
 
     if initialGuard:
         spawn_guard()
@@ -325,10 +368,20 @@ func CreatePools():
 
     DebugUtils._debug_log("AI Spawner: Team-based pools created with factions: %s" % _describe_faction_pool())
 
-func _spawn_initial_population(count: int):
-    for _i in count:
-        if activeAgents < spawnLimit:
-            SpawnWanderer()
+func _spawn_initial_population(count: int) -> void:
+    DebugUtils._debug_log("Starting initial population spawning (async) for %d agents" % count)
+    for attempt in count:
+        if activeAgents >= spawnLimit:
+            DebugUtils._debug_log("Spawn limit reached, stopping initial population spawning")
+            break
+        var before = activeAgents
+        SpawnWanderer()
+        if activeAgents <= before:
+            DebugUtils._debug_log("No agents spawned this attempt, stopping initial population")
+            break
+        # Small delay to avoid overlapping activation and give physics time to settle
+        await get_tree().create_timer(0.05, false).timeout
+    DebugUtils._debug_log("Initial population spawning complete. Active agents: %d" % activeAgents)
 
 ## Spawns a wandering enemy or team
 ## Uses team spawning if enabled, otherwise falls back to individual spawning
@@ -709,59 +762,57 @@ func _spawn_team_wanderer():
     # Get a random agent from pool to determine which faction to spawn
     var pool_agent = APool.get_child(randi() % APool.get_child_count())
     var faction_name = pool_agent.get_meta("enemy_ai_faction")
-    var scene_resource = _scene_for_faction_name(faction_name)
-
-    if scene_resource == null:
-        DebugUtils._debug_log("No scene resource found for faction %s" % faction_name)
-        return
 
     # Generate unique team ID for tracking and coordination
     var team_id = _generate_unique_team_id()
 
     # Spawn the entire team at the chosen location
-    var spawned_team = _spawn_team_at_location(scene_resource, spawn_point, team_id)
+    var spawned_team = _spawn_team_at_location(faction_name, spawn_point, team_id)
 
-    # Remove the spawned agents from pool (they're now active in the world)
-    for agent in spawned_team:
-        if agent.get_parent() == APool:
-            APool.remove_child(agent)
+    if spawned_team.is_empty():
+        DebugUtils._debug_log("Team spawning failed (no slots or no agents)")
+        # Release occupied spawn point since no agents were spawned
+        if EnemyAISettings.enable_team_spawning and occupied_spawn_points.has(spawn_point):
+            occupied_spawn_points.erase(spawn_point)
+            DebugUtils._debug_log("Released occupied spawn point '%s' due to failed team spawn" % spawn_point.name)
+        return
 
-    DebugUtils._debug_log("Team %d spawned with %d %s members at %s" % [team_id, spawned_team.size(), faction_name, str(spawn_point.global_position)])
+    DebugUtils._debug_log("Team %d spawned with %d %s members at %s (active=%d/%d)" % [team_id, spawned_team.size(), faction_name, str(spawn_point.global_position), activeAgents, spawnLimit])
 
-## Finds an available spawn point that isn't currently occupied by another team
-## Returns null if no spawn points are available
-## Uses occupation tracking to prevent teams from spawning at the same location
-## Also ensures spawn point is far enough from player (matching base class behavior)
+## Finds an available spawn point using _get_valid_spawn_points for validation
+## Returns null if no valid spawn points are available
+## Uses occupation tracking when team spawning is enabled to prevent overlap
+## Includes distance, floor, and other validations via _get_valid_spawn_points
 func _find_available_spawn_point() -> Node3D:
     if spawns.is_empty():
         return null
 
-    # Filter spawn points by distance to player (must be > spawnDistance)
-    var valid_spawns = spawns.filter(func(spawn_point):
-        var distance_to_player = spawn_point.global_position.distance_to(gameData.playerPosition)
-        return distance_to_player > spawnDistance
-    )
-
-    if valid_spawns.is_empty():
-        DebugUtils._debug_log("No spawn points far enough from player")
-        return null
-
-    # Filter out spawn points that are currently occupied by active teams
-    var available_spawns = valid_spawns.filter(func(spawn_point):
-        return !occupied_spawn_points.has(spawn_point)
-    )
-
-    if available_spawns.is_empty():
-        # If all valid spawn points are occupied, clear the occupation list as fallback
-        # This allows reuse of spawn points when teams move or are defeated
-        DebugUtils._debug_log("All valid spawn points occupied, clearing occupation tracking")
+    var valid_points = _get_valid_spawn_points()
+    
+    # If no valid points due to occupation, check for defeated teams and release their points
+    if valid_points.is_empty() and EnemyAISettings.enable_team_spawning and not occupied_spawn_points.is_empty():
+        DebugUtils._debug_log("All valid spawn points occupied, checking for defeated teams")
+        _check_and_release_defeated_team_spawn_points()
+        valid_points = _get_valid_spawn_points()
+    
+    # If still empty, clear occupation tracking as fallback
+    if valid_points.is_empty() and EnemyAISettings.enable_team_spawning and not occupied_spawn_points.is_empty():
+        DebugUtils._debug_log("All valid spawn points still occupied, clearing occupation tracking")
         occupied_spawn_points.clear()
-        available_spawns = valid_spawns
-
-    # Select a random available spawn point and mark it as occupied
-    var selected_spawn = available_spawns.pick_random()
-    occupied_spawn_points.append(selected_spawn)
-
+        valid_points = _get_valid_spawn_points()
+    
+    if valid_points.is_empty():
+        DebugUtils._debug_log("No valid spawn points available")
+        return null
+    
+    var selected_spawn = valid_points.pick_random()
+    
+    if EnemyAISettings.enable_team_spawning:
+        occupied_spawn_points.append(selected_spawn)
+        DebugUtils._debug_log("Selected spawn point '%s' at %s (now occupied)" % [selected_spawn.name, str(selected_spawn.global_position)])
+    else:
+        DebugUtils._debug_log("Selected spawn point '%s' at %s" % [selected_spawn.name, str(selected_spawn.global_position)])
+    
     return selected_spawn
 
 ## Generates a unique ID for each team
@@ -805,37 +856,60 @@ func _check_and_release_defeated_team_spawn_points():
 ## Returns array of spawned agent nodes
 ## Each team member gets metadata for faction, team ID, and member index
 ## Agents are activated as wanderers to match base class behavior
-func _spawn_team_at_location(scene_resource, spawn_point: Node3D, team_id: int) -> Array:
-    var faction_name = _packed_scene_name(scene_resource)
+func _spawn_team_at_location(faction_name: String, spawn_point: Node3D, team_id: int) -> Array:
     var team_size = _get_team_size_for_faction(faction_name)
+    var available_slots = spawnLimit - activeAgents
+    if available_slots <= 0:
+        DebugUtils._debug_log("Cannot spawn team: spawn limit reached (active=%d, limit=%d)" % [activeAgents, spawnLimit])
+        return []
+    team_size = min(team_size, available_slots)
     var spawned_agents = []
 
-    # Spawn each member of the team
-    for i in team_size:
-        var new_agent = scene_resource.instantiate()
-        agents.add_child(new_agent, true)
+    # Find available agents in pool matching the faction
+    var available_agents = []
+    for child in APool.get_children():
+        if child.get_meta("enemy_ai_faction") == faction_name:
+            available_agents.append(child)
 
-        new_agent.boss = false
-        new_agent.AISpawner = self
+    # Take up to team_size agents from the pool
+    var agents_to_spawn = available_agents.slice(0, min(team_size, available_agents.size()))
+
+    # Spawn each member of the team
+    for i in agents_to_spawn.size():
+        var agent = agents_to_spawn[i]
+        APool.remove_child(agent)
+        agents.add_child(agent, true)
+
+        # Ensure proper setup (some may already be set, but refresh)
+        agent.boss = false
+        agent.AISpawner = self
         # Set faction for targeting and behavior
-        new_agent.set_meta("enemy_ai_faction", faction_name)
+        agent.set_meta("enemy_ai_faction", faction_name)
         # Set team coordination metadata
-        new_agent.set_meta("team_id", team_id)
-        new_agent.set_meta("team_member_index", i)
+        agent.set_meta("team_id", team_id)
+        agent.set_meta("team_member_index", i)
 
         # Set spawn point for navigation (matching base class)
-        new_agent.currentPoint = spawn_point
+        agent.currentPoint = spawn_point
 
         # Add slight random offset so team members don't occupy exact same position
         var offset = Vector3(randf_range(-2.0, 2.0), 0, randf_range(-2.0, 2.0))
-        new_agent.global_position = spawn_point.global_position + offset
+        agent.global_position = spawn_point.global_position + offset
 
         # Activate the agent as a wanderer (matching base class behavior)
-        new_agent.ActivateWanderer()
+        agent.ActivateWanderer()
 
-        spawned_agents.append(new_agent)
-        activeAgents += 1
+        spawned_agents.append(agent)
+        if is_instance_valid(agent):
+            var before = activeAgents
+            activeAgents += 1
+            DebugUtils._debug_log("Team spawn increment: before=%d after=%d (team %d, faction %s)" % [before, activeAgents, team_id, faction_name])
+        else:
+            DebugUtils._debug_log("Team spawn failed: agent invalid after activation for team %d" % team_id)
 
-        DebugUtils._debug_log("Team member %d/%d spawned for team %d (%s) at %s" % [i+1, team_size, team_id, faction_name, str(spawn_point.global_position)])
+        DebugUtils._debug_log("Team member %d/%d spawned for team %d (%s) at %s" % [i+1, agents_to_spawn.size(), team_id, faction_name, str(spawn_point.global_position)])
+
+    if spawned_agents.size() == 0:
+        DebugUtils._debug_log("Warning: No agents were spawned for team %d" % team_id)
 
     return spawned_agents

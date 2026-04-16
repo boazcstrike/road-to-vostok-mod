@@ -48,16 +48,16 @@ class_name EnemyAISettings
 # When enabled, enemies spawn in coordinated teams rather than individually
 @export var enable_team_spawning = true
 
-# Bandit teams: 3-8 units (larger groups for bandit ambushes)
-@export_range(3, 8, 1) var bandit_team_size_min = 3
-@export_range(3, 8, 1) var bandit_team_size_max = 8
+# Bandit teams: 3-10 units (larger groups for bandit ambushes)
+@export_range(3, 10, 1) var bandit_team_size_min = 3
+@export_range(3, 10, 1) var bandit_team_size_max = 10
 
-# Guard teams: 2-4 units (smaller, disciplined formations)
-@export_range(2, 4, 1) var guard_team_size_min = 2
-@export_range(2, 4, 1) var guard_team_size_max = 4
+# Guard teams: 2-5 units (smaller, disciplined formations)
+@export_range(2, 5, 1) var guard_team_size_min = 2
+@export_range(2, 5, 1) var guard_team_size_max = 5
 
-# Military teams: 2-4 units (tactical fireteams)
-@export_range(2, 4, 1) var military_team_size_min = 2
-@export_range(2, 4, 1) var military_team_size_max = 4
+# Military teams: 2-5 units (tactical fireteams)
+@export_range(2, 5, 1) var military_team_size_min = 2
+@export_range(2, 5, 1) var military_team_size_max = 5
 
 var mcm_enabled = false
