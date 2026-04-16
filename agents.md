@@ -9,7 +9,7 @@ This document outlines the development standards, architectural patterns, and co
 - the project (game mod) folder is in `BosWar`
 - `docs/` is where we keep the documentation and plans
 - `mods/` is where we store the reference mods
-- `Reference Scripts` is where we extract the existing .gd file scripts for reference; **CRITICAL: never edit these files under this folder, and just reference them because these are implementations of the other developers
+- `Reference Scripts` is where we extract the existing .gd file scripts for reference; `./Road to Vostok` is where the game files codebase is; **CRITICAL**: never edit these files under this folder, and just reference them because these are implementations of the other developers
     - all Main files under this folder will be from the base game codes just like `AISpawnerMain.gd`
 - `realistic shaders` is for the realistic shaders of the game
 

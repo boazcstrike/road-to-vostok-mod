@@ -21,6 +21,8 @@ const AI_HEARING_RUN_DISTANCE = 22.0
 const AI_HEARING_WALK_DISTANCE = 8.0
 const AI_HEARING_GUNSHOT_DISTANCE = 60.0
 const AI_GUNSHOT_MEMORY_TIME = 1.25
+var current_target_type = "none"  # "player", "ai", or "none"
+var current_target_score = 0.0
 
 func Activate():
     if boss:
@@ -54,7 +56,6 @@ func Sensor(delta):
 
             if !player_detected and _has_valid_ai_target() and currentAITargetVisible:
                 lastKnownLocation = _get_ai_target_position()
-                playerVisible = true
 
                 if currentState == State.Wander or currentState == State.Guard or currentState == State.Patrol:
                     Decision()
@@ -100,6 +101,7 @@ func Hearing():
     if (playerDistance3D < run_distance and gameData.isRunning) or (playerDistance3D < walk_distance and gameData.isWalking):
         if currentState != State.Ambush:
             lastKnownLocation = playerPosition
+            _broadcast_target_to_teammates(playerPosition, "audio_player")
 
 func FireDetection(delta):
     if !_can_target_player():
@@ -112,12 +114,14 @@ func FireDetection(delta):
     if gameData.isFiring and !playerVisible:
         if fireVector > 0.95:
             lastKnownLocation = playerPosition
+            _broadcast_target_to_teammates(playerPosition, "audio_player")
 
             fireDetected = true
             extraVisibility = 50.0 * max(0.25, EnemyAISettings.ai_sight_multiplier)
         elif playerDistance3D < local_alert_distance:
             if currentState != State.Ambush:
                 lastKnownLocation = playerPosition
+                _broadcast_target_to_teammates(playerPosition, "audio_player")
 
             fireDetected = true
             extraVisibility = 50.0 * max(0.25, EnemyAISettings.ai_sight_multiplier)
@@ -136,7 +140,10 @@ func Decision():
     var can_direct_attack = _can_direct_attack_target()
 
     if engagement_distance > 20:
-        var decision = randi_range(1, 9)
+        var max_decision = 9
+        if _count_teammates_targeting_same() > 0:
+            max_decision = 12  # Add 3 more slots for Combat (covering fire)
+        var decision = randi_range(1, max_decision)
 
         if decision == 1:
             ChangeState("Combat")
@@ -303,10 +310,12 @@ func FireFrequency():
 
 func FireAccuracy() -> Vector3:
     var fireDirection = _get_fire_target_position()
+    var xform = Basis.looking_at(fireDirection - fire.global_position)
     var spreadMultiplier = 1.0
     var accuracy_multiplier = max(0.1, EnemyAISettings.ai_accuracy_multiplier)
     var engagement_distance = _get_engagement_distance()
     var ai_target = _has_valid_ai_target()
+    var offset = Vector3(0, 0, 0)
 
     if fullAuto and !boss:
         spreadMultiplier = 2.0
@@ -337,7 +346,7 @@ func FireAccuracy() -> Vector3:
         fireDirection.x += randf_range(-2.0, 2.0) * spreadMultiplier / accuracy_multiplier
         fireDirection.y += randf_range(-2.0, 2.0) * spreadMultiplier / accuracy_multiplier
 
-    return fireDirection
+    return fireDirection + xform * offset
 
 func Raycast():
     fire.look_at(FireAccuracy(), Vector3.UP, true)
@@ -500,11 +509,8 @@ func Spine(delta):
     var spinePose: Transform3D = skeleton.get_bone_global_pose_no_override(spineData.bone)
     var aimTarget: Vector3
 
-    if _has_valid_ai_target():
-        aimTarget = -skeleton.to_local(_get_spine_target_position()) + Vector3(0, 1, 0)
-    else:
-        aimTarget = -skeleton.to_local(LKL)
-        aimTarget += Vector3(0, 1, 0)
+    var engagement_pos = _get_engagement_position()
+    aimTarget = -skeleton.to_local(engagement_pos) + Vector3(0, 1, 0)
 
     var spineAimPose = spinePose.looking_at(aimTarget, Vector3.UP)
     spineAimPose.basis = spineAimPose.basis.rotated(spineAimPose.basis.x, deg_to_rad(spineTarget.x))
@@ -597,6 +603,8 @@ func _refresh_player_alignment_state():
 
     if !_has_valid_ai_target():
         targetLabel = "None"
+        current_target_type = "none"
+        current_target_score = 0.0
 
     DebugUtils._debug_log("Player alignment cleared hostility for faction=%s" % _self_faction())
 
@@ -623,16 +631,13 @@ func _update_hostile_ai_targeting(delta):
     targetRefreshTimer -= delta
     targetVisibilityTimer -= delta
 
-    if !_has_valid_ai_target() or targetRefreshTimer <= 0.0:
-        var previousTarget = currentAITarget
-        currentAITarget = _acquire_hostile_ai_target()
+    if (current_target_type == "none" or !_has_valid_ai_target()) or targetRefreshTimer <= 0.0:
+        var result = _acquire_best_target()
         targetRefreshTimer = current_refresh_cycle
         targetVisibilityTimer = 0.0
 
-        if currentAITarget != previousTarget:
-            if is_instance_valid(currentAITarget):
-                _update_target_visibility()
-                targetVisibilityTimer = current_visibility_cycle
+        if result != null:
+            if current_target_type == "ai" and is_instance_valid(currentAITarget):
                 DebugUtils._debug_log("Hostile target acquired: %s" % targetLabel)
                 _push_debug_status("Hostile target acquired")
 
@@ -744,6 +749,7 @@ func _sense_ai_audio():
         return
 
     currentAITarget = audible_target
+    _broadcast_target_to_teammates(_get_ai_target_position(audible_target), "audio_ai", audible_target)
     currentAITargetDistance = global_position.distance_to(audible_target.global_position)
     currentAITargetVisible = false
     lastKnownLocation = _get_ai_target_position(audible_target)
@@ -829,46 +835,67 @@ func _target_fired_recently(target_node: Node3D) -> bool:
 func _mark_ai_gunshot():
     set_meta("enemy_ai_last_shot_time", float(Time.get_ticks_msec()) / 1000.0)
 
-func _acquire_hostile_ai_target() -> Node3D:
-    if !is_instance_valid(AISpawner) or !is_instance_valid(AISpawner.agents):
+func _acquire_best_target():
+    var candidates = []
+
+    # Add player if can target and visible
+    if _can_target_player() and playerVisible:
+        var player_pos = playerPosition
+        var player_dist = global_position.distance_to(player_pos)
+        candidates.append({"type": "player", "position": player_pos, "distance": player_dist, "visible": true})
+
+    # Add hostile AI if visible
+    if is_instance_valid(AISpawner) and is_instance_valid(AISpawner.agents):
+        for child in AISpawner.agents.get_children():
+            if _is_valid_hostile_ai_target(child) and _can_see_ai_target(child):
+                var ai_pos = _get_ai_target_position(child)
+                var ai_dist = global_position.distance_to(ai_pos)
+                candidates.append({"type": "ai", "node": child, "position": ai_pos, "distance": ai_dist, "visible": true})
+
+    if candidates.size() == 0:
         return null
 
-    var nearestTarget: Node3D = null
-    var nearestDistance = 9999.0
+    # Calculate scores
+    var forward = -global_transform.basis.z.normalized()
+    var best_candidate = null
+    var best_score = -1.0
 
-    for child in AISpawner.agents.get_children():
-        if !_is_valid_hostile_ai_target(child):
-            continue
+    for candidate in candidates:
+        var dir_to_target = (candidate.position - global_position).normalized()
+        var angle = acos(clamp(forward.dot(dir_to_target), -1.0, 1.0))
+        var visibility_bonus = 2.0 if candidate.visible else 1.0
+        var ai_bonus = 1.0 if candidate.type == "ai" else 0.0
+        var score = (visibility_bonus + ai_bonus) * cos(angle) / (1.0 + candidate.distance)
 
-        var distanceToTarget = global_position.distance_to(child.global_position)
-        if distanceToTarget < nearestDistance and distanceToTarget <= 120.0:
-            nearestDistance = distanceToTarget
-            nearestTarget = child
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
 
-    var selectedTarget = _choose_hostile_target_with_hysteresis(nearestTarget, nearestDistance)
-    return selectedTarget
+    # Hysteresis: only switch if new score is 20% higher
+    if current_target_type != "none" and best_score < current_target_score * 1.2:
+        return null
 
-func _choose_hostile_target_with_hysteresis(best_candidate: Node3D, best_distance: float) -> Node3D:
-    if !_has_valid_ai_target():
-        return best_candidate
+    # Set new target
+    current_target_score = best_score
 
-    if !is_instance_valid(best_candidate):
-        return currentAITarget
-
-    if best_candidate == currentAITarget:
-        return currentAITarget
-
-    var current_distance = global_position.distance_to(currentAITarget.global_position)
-
-    if currentAITargetVisible:
-        if best_distance < current_distance * 0.75:
-            return best_candidate
-        return currentAITarget
-
-    if best_distance < current_distance * 0.9:
-        return best_candidate
-
-    return currentAITarget
+    if best_candidate.type == "player":
+        _clear_ai_target()
+        current_target_type = "player"
+        playerVisible = true
+        lastKnownLocation = best_candidate.position
+        targetLabel = "Player %.1fm" % best_candidate.distance
+        DebugUtils._debug_log("AI %s: Acquired PLAYER target (dist=%.1f score=%.3f)" % [_self_faction(), best_candidate.distance, best_score])
+        _broadcast_target_to_teammates(best_candidate.position, best_candidate.type)
+        return "player"
+    else:
+        currentAITarget = best_candidate.node
+        current_target_type = "ai"
+        _update_target_visibility()
+        _set_target_label()
+        var ai_faction = best_candidate.node.get_meta("enemy_ai_faction", "Unknown")
+        DebugUtils._debug_log("AI %s: Acquired AI %s target (dist=%.1f score=%.3f)" % [_self_faction(), ai_faction, best_candidate.distance, best_score])
+        _broadcast_target_to_teammates(best_candidate.position, best_candidate.type, best_candidate.node)
+        return best_candidate.node
 
 func _is_valid_hostile_ai_target(node) -> bool:
     if !is_instance_valid(node):
@@ -983,22 +1010,22 @@ func _get_ai_target_position(target_node = null) -> Vector3:
     return target_node.global_position + Vector3(0, 0.8, 0)
 
 func _get_fire_target_position() -> Vector3:
-    if _has_valid_ai_target():
+    if current_target_type == "ai" and _has_valid_ai_target():
         var torsoPosition = _get_ai_torso_position()
         if torsoPosition != Vector3.ZERO:
             return torsoPosition
 
-    return playerPosition + Vector3(0, 1.0, 0)
+    return _get_engagement_position() + Vector3(0, 1.0, 0)
 
 func _get_spine_target_position() -> Vector3:
-    if _has_valid_ai_target():
+    if current_target_type == "ai" and _has_valid_ai_target():
         var spineTorsoPosition = _get_ai_spine_torso_position()
         if spineTorsoPosition != Vector3.ZERO:
             return spineTorsoPosition
 
         return currentAITarget.global_position + Vector3(0, 1.0, 0)
 
-    return LKL
+    return _get_engagement_position()
 
 func _get_ai_torso_position(target_node = null) -> Vector3:
     if target_node == null:
@@ -1042,32 +1069,38 @@ func _is_ai_root_hit(hitCollider) -> bool:
     return _is_valid_hostile_ai_target(hitCollider)
 
 func _get_engagement_position() -> Vector3:
-    if _has_valid_ai_target():
+    if current_target_type == "player":
+        return lastKnownLocation
+    elif _has_valid_ai_target():
         return _get_ai_target_position()
     return playerPosition
 
 func _get_engagement_distance() -> float:
-    if _has_valid_ai_target():
+    if current_target_type == "player":
+        return playerDistance3D
+    elif _has_valid_ai_target():
         return currentAITargetDistance
     return playerDistance3D
 
 func _engagement_visible() -> bool:
-    if _has_valid_ai_target():
+    if current_target_type == "player":
+        return playerVisible
+    elif _has_valid_ai_target():
         return currentAITargetVisible
     return playerVisible
 
 func _can_direct_attack_target() -> bool:
-    if _has_valid_ai_target():
+    if current_target_type == "ai" and _has_valid_ai_target():
         return true
     return !gameData.isTrading
 
 func _player_only_combat_blocked() -> bool:
-    if _has_valid_ai_target():
+    if current_target_type == "ai" and _has_valid_ai_target():
         return false
     return gameData.isTrading
 
 func _should_play_player_bullet_audio() -> bool:
-    return _can_target_player()
+    return current_target_type == "player" or _can_target_player()
 
 func _clear_ai_target(push_status: bool = true):
     currentAITarget = null
@@ -1075,16 +1108,19 @@ func _clear_ai_target(push_status: bool = true):
     currentAITargetDistance = 9999.0
     targetLabel = "None"
     previousAITargetVisible = false
+    current_target_type = "none"
+    current_target_score = 0.0
 
     if push_status:
         _push_debug_status("No active hostile target")
 
 func _set_target_label():
-    if !_has_valid_ai_target():
+    if current_target_type == "player":
+        targetLabel = "Player %.1fm" % playerDistance3D
+    elif _has_valid_ai_target():
+        targetLabel = "%s %.1fm" % [_self_or_target_faction_name(currentAITarget), currentAITargetDistance]
+    else:
         targetLabel = "None"
-        return
-
-    targetLabel = "%s %.1fm" % [_self_or_target_faction_name(currentAITarget), currentAITargetDistance]
 
 func _self_or_target_faction_name(target_node: Node3D) -> String:
     if is_instance_valid(target_node) and target_node.has_meta("enemy_ai_faction"):
@@ -1147,6 +1183,19 @@ func _try_apply_targeted_hitbox_damage(hitCollider) -> bool:
 
     return false
 
+func Selector(delta):
+    # Call base Selector logic first
+    super(delta)
+
+    # Bandit-specific full auto logic: increase chance when close (< 30 meters)
+    if _self_faction() == "bandit" and _get_engagement_distance() < 30.0:
+        # Higher chance of full auto for bandits in close range
+        # Base chance is probably random, so we override with higher probability
+        if randf() < 0.8:  # 80% chance of full auto when < 30m
+            fullAuto = true
+        else:
+            fullAuto = false
+
 func _get_preferred_hit_targets(hitCollider) -> Array:
     var targets: Array = []
 
@@ -1172,3 +1221,91 @@ func _get_preferred_hit_targets(hitCollider) -> Array:
 
     targets.append(_get_fire_target_position())
     return targets
+
+func _broadcast_target_to_teammates(target_position: Vector3, target_type: String, target_node: Node3D = null):
+    if !is_instance_valid(AISpawner) or !is_instance_valid(AISpawner.agents):
+        return
+
+    var self_faction = _self_faction()
+
+    for child in AISpawner.agents.get_children():
+        if child == self:
+            continue
+        if !child.has_meta("enemy_ai_faction") or str(child.get_meta("enemy_ai_faction")) != self_faction:
+            continue
+
+        var distance = global_position.distance_to(child.global_position)
+        if distance > 50.0:  # broadcast range
+            continue
+
+        # Inform the teammate
+        if child.has_method("_receive_teammate_target_info"):
+            child._receive_teammate_target_info(target_position, target_type, target_node)
+
+func _receive_teammate_target_info(target_position: Vector3, target_type: String, target_node: Node3D = null):
+    # Update lastKnownLocation
+    lastKnownLocation = target_position
+
+    # If no current target, try to acquire this one
+    if current_target_type == "none":
+        if target_type == "player" or target_type == "audio_player":
+            current_target_type = "player"
+            targetLabel = "Player (teammate info)"
+            playerVisible = false  # since it's from teammate
+        elif target_type == "ai" and is_instance_valid(target_node):
+            currentAITarget = target_node
+            current_target_type = "ai"
+            _update_target_visibility()
+            _set_target_label()
+        elif target_type == "audio_ai" and is_instance_valid(target_node):
+            currentAITarget = target_node
+            current_target_type = "ai"
+            currentAITargetVisible = false
+            _set_target_label()
+
+        # Maybe trigger decision if in passive state
+        if currentState == State.Wander or currentState == State.Guard or currentState == State.Patrol:
+            Decision()
+    # If has own engagement but it's far (>50m), switch to teammate's target
+    elif _get_engagement_distance() > 50.0:
+        if target_type == "player" or target_type == "audio_player":
+            _clear_ai_target()
+            current_target_type = "player"
+            targetLabel = "Player (teammate info)"
+            playerVisible = false
+        elif target_type == "ai" and is_instance_valid(target_node):
+            currentAITarget = target_node
+            current_target_type = "ai"
+            _update_target_visibility()
+            _set_target_label()
+        elif target_type == "audio_ai" and is_instance_valid(target_node):
+            currentAITarget = target_node
+            current_target_type = "ai"
+            currentAITargetVisible = false
+            _set_target_label()
+
+        # Trigger decision if needed
+        if currentState == State.Wander or currentState == State.Guard or currentState == State.Patrol:
+            Decision()
+
+func _count_teammates_targeting_same() -> int:
+    if !is_instance_valid(AISpawner) or !is_instance_valid(AISpawner.agents):
+        return 0
+
+    var self_faction = _self_faction()
+    var count = 0
+
+    for child in AISpawner.agents.get_children():
+        if child == self:
+            continue
+        if !child.has_meta("enemy_ai_faction") or str(child.get_meta("enemy_ai_faction")) != self_faction:
+            continue
+
+        var child_target_type = child.get("current_target_type")
+        if child_target_type == current_target_type:
+            if current_target_type == "player":
+                count += 1
+            elif current_target_type == "ai" and child.get("currentAITarget") == currentAITarget:
+                count += 1
+
+    return count

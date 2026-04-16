@@ -26,7 +26,7 @@ class_name EnemyAISettings
 @export var bandit_infighting_enabled = false
 @export var guard_infighting_enabled = false
 @export var military_infighting_enabled = false
-@export var warfare_enabled = false
+@export var warfare_enabled = true
 @export var player_faction_alignment = 0
 @export var corpse_cleanup_limit = 20
 @export var player_invulnerable = false

@@ -35,10 +35,10 @@ func _ready():
     initialGuard = EnemyAISettings.initial_guard
     initialHider = EnemyAISettings.initial_hider
     noHiding = EnemyAISettings.disable_hiding
-    initial_rush_mode = true  # Start in rush mode for fast initial population
-    initial_burst_duration = 5.0 * 60.0  # 5 minutes of initial burst
-    initial_burst_limit = spawnLimit * 2  # Allow up to 2x spawn limit during burst
-    game_start_time = Time.get_ticks_msec() / 1000.0  # Track when game started
+    # initial_rush_mode = true  # Start in rush mode for fast initial population
+    # initial_burst_duration = 5.0 * 60.0  # 5 minutes of initial burst
+    # initial_burst_limit = spawnLimit * 2  # Allow up to 2x spawn limit during burst
+    # game_start_time = Time.get_ticks_msec() / 1000.0  # Track when game started
 
     DebugUtils._debug_log("Spawner ready on scene '%s' with zone '%s'" % [get_tree().current_scene.name, _zone_name()])
     DebugUtils._debug_log("Points: spawns=%d, waypoints=%d, patrols=%d, covers=%d, hides=%d" % [spawns.size(), waypoints.size(), patrols.size(), covers.size(), hides.size()])
@@ -73,36 +73,30 @@ func _physics_process(delta):
 
     if spawnTime <= 0:
         # Check current time and determine effective spawn limit
-        var current_time = Time.get_ticks_msec() / 1000.0
-        var time_since_start = current_time - game_start_time
-        var in_initial_burst = time_since_start < initial_burst_duration
-        var effective_limit = initial_burst_limit if in_initial_burst else spawnLimit
+        # var current_time = Time.get_ticks_msec() / 1000.0
+        # var time_since_start = current_time - game_start_time
+        # var in_initial_burst = time_since_start < initial_burst_duration
+        var effective_limit = spawnLimit  # Always use normal spawn limit
 
         if activeAgents < effective_limit:
-            var limit_type = "burst" if in_initial_burst else "normal"
+            var limit_type = "normal"
             DebugUtils._debug_log("Spawn attempt: active=%d %s_limit=%d pool_remaining=%d" % [activeAgents, limit_type, effective_limit, APool.get_child_count()])
             SpawnWanderer()
 
             # Check if we've reached the spawn limit and switch to regular intervals
-            if activeAgents >= spawnLimit and initial_rush_mode:
-                initial_rush_mode = false
-                DebugUtils._debug_log("Switched from initial rush mode to regular spawn intervals")
+            # if activeAgents >= spawnLimit and initial_rush_mode:
+            #     initial_rush_mode = false
+            #     DebugUtils._debug_log("Switched from initial rush mode to regular spawn intervals")
         else:
-            var limit_type = "burst" if in_initial_burst else "normal"
+            var limit_type = "normal"
             DebugUtils._debug_log("Spawn skipped because active AI reached %s limit (%d/%d)" % [limit_type, activeAgents, effective_limit])
             _debug_push_status("Active limit reached")
 
         # Set next spawn timer based on current mode
-        var interval_profile
-        if initial_rush_mode:
-            # Initial rush: 3-5 second intervals
-            interval_profile = {"min": 3.0, "max": 5.0}
-        else:
-            # Regular intervals from preset
-            interval_profile = _get_spawn_interval_profile()
+        var interval_profile = _get_spawn_interval_profile()  # Always use regular intervals
 
         spawnTime = randf_range(interval_profile["min"], interval_profile["max"])
-        var mode_name = "rush" if initial_rush_mode else "regular"
+        var mode_name = "regular"
         DebugUtils._debug_log("Next spawn timer set to %.2fs (%s mode)" % [spawnTime, mode_name])
         _debug_push_status("Spawn timer reset")
 
@@ -158,9 +152,9 @@ func _get_preset_profile() -> Dictionary:
             }
         _:  # Default/Low intensity - minimal threat
             return {
-                "spawn_limit": 16,        # Max 3 active enemies at once
-                "spawn_pool": 32,        # Total of 10 enemies available to spawn
-                "initial_population": 8, # Start with no enemies
+                "spawn_limit": 18,        # Max 18 active enemies at once
+                "spawn_pool": 32,        # Total of 32 enemies available to spawn
+                "initial_population": 8, # Start with 8 enemies
                 "spawn_min": 10.0,        # Spawn intervals: 10-45 seconds
                 "spawn_max": 45.0
             }
@@ -187,12 +181,12 @@ func _get_spawn_pool() -> int:
     return max(1, profile["spawn_pool"] + EnemyAISettings.spawn_pool_bonus)
 
 ## Returns the number of AI agents to spawn when the system initializes
-## For initial burst, start with the spawn limit to quickly populate
+## Controlled initial population without burst
 func _get_initial_population() -> int:
     var profile = _get_preset_profile()
     var base_initial = profile["initial_population"] + EnemyAISettings.initial_population_bonus
-    # Start with spawn limit for faster initial population during burst phase
-    return max(0, max(base_initial, spawnLimit))
+    # Start with base initial population for controlled spawning
+    return max(0, base_initial)
 
 ## Returns the spawn interval range (min/max seconds between spawns)
 ## Applies performance scaling and ensures minimum viable intervals
