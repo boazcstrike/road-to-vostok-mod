@@ -32,6 +32,16 @@ class_name EnemyAISettings
 @export var player_invulnerable = false
 @export var show_debug_overlay = false
 @export var show_debug_logs = false
+@export var teammate_message_duplicate_ttl_seconds = 0.1
+@export var teammate_decision_debounce_seconds = 0.05
+@export var enable_threaded_scoring_shadow_mode = false
+@export var threaded_scoring_min_candidates_for_thread = 8
+@export var threaded_scoring_max_global_jobs = 2
+@export var threaded_scoring_candidate_cap = 32
+# Evaluates shadow scoring for agents where (instance_id % modulo == frame % modulo).
+@export var threaded_scoring_cohort_modulo = 4
+@export var threaded_scoring_top_k = 3
+@export var show_threaded_scoring_stats = false
 @export var replenish_spawn_pool = true
 
 @export var ai_health_multiplier = 1.0

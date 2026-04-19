@@ -16,8 +16,8 @@ func _ready() -> void:
     config.set_value("Dropdown", "intensity_preset", {
         "name" = "Enemy Density Preset",
         "tooltip" = "Main enemy count preset. Higher options allow more enemies, larger reserve pools, faster reinforcements, and more enemies already active when the map starts.",
-        "default" = 3,
-        "value" = 3,
+        "default" = 0,
+        "value" = 0,
         "menu_pos" = 1,
         "options" = [
             "Default",
@@ -451,7 +451,7 @@ func _sync_config_metadata(config: ConfigFile) -> bool:
         "Relentless"
     ]) or changed
 
-    changed = _sync_dropdown_default(config, "intensity_preset", 3) or changed
+    changed = _sync_dropdown_default(config, "intensity_preset", 0) or changed
 
     return changed
 

@@ -48,11 +48,38 @@ const AI_GUNSHOT_MEMORY_TIME = 1.25
 const TRACE_TARGETING_COOLDOWN = 4.0
 const TRACE_HOSTILITY_COOLDOWN = 6.0
 const TRACE_VERBOSE = false
+const THREADED_SCORING_PLAYER_ID = 0
+const TEAMMATE_BROADCAST_RANGE_SQ = 2500.0
+const TEAMMATE_TARGET_VALID_DISTANCE_SQ = 10000.0
+const TEAMMATE_DUPLICATE_POSITION_EPSILON_SQ = 2.25
 var current_target_type = "none"  # "player", "ai", or "none"
 var current_target_score = 0.0
 var current_target_quality = QualityTier.SECOND_HAND
 var _last_known_location_data = {"position": Vector3.ZERO, "timestamp": 0.0, "quality": QualityTier.SECOND_HAND}
 var is_close_visual_target: bool = false
+var _shadow_scoring_thread: Thread
+var _shadow_scoring_job_in_flight = false
+var _shadow_scoring_next_job_id = 1
+var _shadow_scoring_active_job_id = 0
+var _shadow_scoring_active_submit_frame = -1
+var _shadow_scoring_active_submit_time_msec = 0
+var _shadow_scoring_last_consumed_submit_frame = -1
+var _shadow_scoring_latest_result = {}
+var jobs_submitted = 0
+var jobs_completed = 0
+var jobs_dropped_stale = 0
+var _shadow_scoring_registered_global_slot = false
+var _last_teammate_decision_time = -9999.0
+var _last_teammate_broadcast = {
+    "timestamp": 0.0,
+    "target_type": "",
+    "position": Vector3.ZERO,
+    "target_id": -1,
+    "quality": QualityTier.SECOND_HAND
+}
+var _last_debug_status_push_time = -9999.0
+var _last_debug_status_event = ""
+var _last_debug_status_target = ""
 
 func Activate():
     if boss:
@@ -69,6 +96,8 @@ func Activate():
     broadcastCooldownPlayer = 0.0
     broadcastCooldownAI = 0.0
     lastKnownLocation = Vector3.ZERO
+    if !is_connected("tree_exited", Callable(self, "_on_tree_exited_shadow_scoring_cleanup")):
+        connect("tree_exited", Callable(self, "_on_tree_exited_shadow_scoring_cleanup"))
 
     super()
 
@@ -83,8 +112,9 @@ func Sensor(delta):
 
     if sensorTimer > sensorCycle:
         var player_detected = _sense_player_los()
+        var custom_targeting_active = _custom_ai_targeting_active()
 
-        if _custom_ai_targeting_active():
+        if custom_targeting_active:
             if !player_detected and _has_valid_ai_target() and currentAITargetVisible:
                 _last_known_location_data = {"position": _get_ai_target_position(), "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
                 lastKnownLocation = _last_known_location_data.position
@@ -94,7 +124,7 @@ func Sensor(delta):
                 elif currentState == State.Ambush:
                     ChangeState("Combat")
 
-        if _custom_ai_targeting_active() and !_has_stable_visible_ai_target() and aiAudioSenseTimer <= 0.0:
+        if custom_targeting_active and !_has_stable_visible_ai_target() and aiAudioSenseTimer <= 0.0:
             _sense_ai_audio()
             aiAudioSenseTimer = _current_ai_audio_cycle()
 
@@ -785,8 +815,99 @@ func _trace_log(suffix: String, message: String, cooldown_seconds: float = TRACE
         return
     DebugUtils._debug_log_rate_limited(_trace_key(suffix), "[trace] " + message, cooldown_seconds)
 
+func _get_active_agent_candidates() -> Array:
+    if !is_instance_valid(AISpawner):
+        return []
+    if AISpawner.has_method("get_all_active_agents_ref"):
+        return AISpawner.get_all_active_agents_ref()
+    if AISpawner.has_method("get_all_active_agents"):
+        return AISpawner.get_all_active_agents()
+    if AISpawner.has_method("get_active_agents_snapshot"):
+        var snapshot_payload = AISpawner.get_active_agents_snapshot()
+        if typeof(snapshot_payload) == TYPE_DICTIONARY:
+            return snapshot_payload.get("all_active_agents", [])
+        if typeof(snapshot_payload) == TYPE_ARRAY:
+            return snapshot_payload
+        return []
+    if is_instance_valid(AISpawner.agents):
+        return AISpawner.agents.get_children()
+    return []
+
+func _get_teammate_candidates(self_faction: String) -> Array:
+    if !is_instance_valid(AISpawner):
+        return []
+    if AISpawner.has_method("get_active_agents_by_faction_ref"):
+        return AISpawner.get_active_agents_by_faction_ref(self_faction)
+    if AISpawner.has_method("get_active_agents_by_faction"):
+        return AISpawner.get_active_agents_by_faction(self_faction)
+    return _get_active_agent_candidates()
+
+func _shadow_scoring_global_jobs_in_flight() -> int:
+    if !is_instance_valid(AISpawner):
+        return 0
+    return int(AISpawner.get_meta("boswar_shadow_jobs_in_flight", 0))
+
+func _set_shadow_scoring_global_jobs_in_flight(value: int):
+    if !is_instance_valid(AISpawner):
+        return
+    AISpawner.set_meta("boswar_shadow_jobs_in_flight", max(0, value))
+
+func _increment_shadow_scoring_global_jobs(delta: int):
+    _set_shadow_scoring_global_jobs_in_flight(_shadow_scoring_global_jobs_in_flight() + delta)
+
+func _release_shadow_scoring_global_slot_if_needed():
+    if !_shadow_scoring_registered_global_slot:
+        return
+    _increment_shadow_scoring_global_jobs(-1)
+    _shadow_scoring_registered_global_slot = false
+
+func _should_skip_duplicate_teammate_broadcast(target_position: Vector3, target_type: String, target_node: Node3D, quality: QualityTier) -> bool:
+    var duplicate_ttl = max(0.0, float(EnemyAISettings.teammate_message_duplicate_ttl_seconds))
+    if duplicate_ttl <= 0.0:
+        return false
+
+    var now_seconds = Time.get_ticks_msec() / 1000.0
+    var elapsed = now_seconds - float(_last_teammate_broadcast.get("timestamp", 0.0))
+    if elapsed > duplicate_ttl:
+        return false
+
+    if str(_last_teammate_broadcast.get("target_type", "")) != target_type:
+        return false
+
+    var target_id = int(target_node.get_instance_id()) if is_instance_valid(target_node) else -1
+    if int(_last_teammate_broadcast.get("target_id", -1)) != target_id:
+        return false
+
+    var previous_quality = int(_last_teammate_broadcast.get("quality", QualityTier.SECOND_HAND))
+    if int(quality) < previous_quality:
+        return false
+
+    var previous_position: Vector3 = _last_teammate_broadcast.get("position", Vector3.ZERO)
+    if previous_position.distance_squared_to(target_position) > TEAMMATE_DUPLICATE_POSITION_EPSILON_SQ:
+        return false
+
+    return true
+
+func _record_teammate_broadcast(target_position: Vector3, target_type: String, target_node: Node3D, quality: QualityTier):
+    var target_id = int(target_node.get_instance_id()) if is_instance_valid(target_node) else -1
+    _last_teammate_broadcast = {
+        "timestamp": Time.get_ticks_msec() / 1000.0,
+        "target_type": target_type,
+        "position": target_position,
+        "target_id": target_id,
+        "quality": int(quality)
+    }
+
 func _update_hostile_ai_targeting(delta):
+    if EnemyAISettings.enable_threaded_scoring_shadow_mode or _shadow_scoring_job_in_flight:
+        _consume_shadow_scoring_result()
+
+    if bool(get("dead")) or bool(get("pause")):
+        _clear_shadow_scoring_runtime_state(false)
+        return
+
     if !_custom_ai_targeting_active():
+        _clear_shadow_scoring_runtime_state(false)
         _trace_log(
             "targeting_gate_off",
             "Targeting gate OFF faction=%s team=%d warfare=%s infight(B/G/M)=%s/%s/%s current_target=%s" % [
@@ -816,10 +937,16 @@ func _update_hostile_ai_targeting(delta):
     broadcastCooldownPlayer -= delta
     broadcastCooldownAI -= delta
 
-    if (current_target_type == "none" or !_has_valid_ai_target()) or targetRefreshTimer <= 0.0:
+    var has_valid_ai_target = _has_valid_ai_target()
+    if (current_target_type == "none" or !has_valid_ai_target) or targetRefreshTimer <= 0.0:
         var result = _acquire_best_target()
-        targetRefreshTimer = current_refresh_cycle
+        var refresh_stagger = max(0.0, targetRefreshJitter * 0.5)
+        targetRefreshTimer = max(0.05, current_refresh_cycle + randf_range(-refresh_stagger, refresh_stagger))
         targetVisibilityTimer = 0.0
+        if result != null:
+            var visibility_stagger = max(0.0, targetVisibilityJitter * 0.5)
+            targetVisibilityTimer = max(0.03, current_visibility_cycle + randf_range(-visibility_stagger, visibility_stagger))
+        has_valid_ai_target = _has_valid_ai_target()
 
         if result != null:
             if current_target_type == "ai" and is_instance_valid(currentAITarget):
@@ -838,7 +965,7 @@ func _update_hostile_ai_targeting(delta):
                 ]
             )
 
-    if !_has_valid_ai_target():
+    if !has_valid_ai_target:
         _update_target_visibility()
     else:
         currentAITargetDistance = global_position.distance_to(currentAITarget.global_position)
@@ -846,7 +973,293 @@ func _update_hostile_ai_targeting(delta):
 
         if targetVisibilityTimer <= 0.0:
             _update_target_visibility()
-            targetVisibilityTimer = current_visibility_cycle
+            var visibility_stagger = max(0.0, targetVisibilityJitter * 0.5)
+            targetVisibilityTimer = max(0.03, current_visibility_cycle + randf_range(-visibility_stagger, visibility_stagger))
+
+    _submit_shadow_scoring_job_if_due()
+
+func _submit_shadow_scoring_job_if_due():
+    if !EnemyAISettings.enable_threaded_scoring_shadow_mode:
+        return
+    if _shadow_scoring_job_in_flight:
+        return
+
+    var cohort_modulo = max(1, int(EnemyAISettings.threaded_scoring_cohort_modulo))
+    if cohort_modulo > 1:
+        var frame_mod = int(Engine.get_process_frames()) % cohort_modulo
+        var cohort_slot = int(get_instance_id()) % cohort_modulo
+        if frame_mod != cohort_slot:
+            return
+
+    var payload = _build_shadow_scoring_payload()
+    if payload.is_empty():
+        return
+
+    var payload_candidates = payload.get("candidates", [])
+    var candidate_count = payload_candidates.size() if typeof(payload_candidates) == TYPE_ARRAY else 0
+    var min_candidates_for_thread = max(0, int(EnemyAISettings.threaded_scoring_min_candidates_for_thread))
+    if candidate_count < min_candidates_for_thread:
+        jobs_submitted += 1
+        jobs_completed += 1
+        _shadow_scoring_next_job_id += 1
+        _consume_shadow_scoring_payload_result(_shadow_scoring_worker(payload))
+        return
+
+    var max_global_jobs = max(1, int(EnemyAISettings.threaded_scoring_max_global_jobs))
+    if _shadow_scoring_global_jobs_in_flight() >= max_global_jobs:
+        return
+
+    var worker_thread = Thread.new()
+    var start_err = worker_thread.start(Callable(self, "_shadow_scoring_worker").bind(payload))
+    if start_err != OK:
+        return
+
+    _increment_shadow_scoring_global_jobs(1)
+    _shadow_scoring_registered_global_slot = true
+    _shadow_scoring_thread = worker_thread
+    _shadow_scoring_job_in_flight = true
+    _shadow_scoring_active_job_id = int(payload.get("job_id", 0))
+    _shadow_scoring_active_submit_frame = int(payload.get("submit_frame", -1))
+    _shadow_scoring_active_submit_time_msec = int(payload.get("submit_time_msec", 0))
+    _shadow_scoring_next_job_id += 1
+    jobs_submitted += 1
+
+func _consume_shadow_scoring_result():
+    if !_shadow_scoring_job_in_flight:
+        return
+    if _shadow_scoring_thread == null:
+        _release_shadow_scoring_global_slot_if_needed()
+        _shadow_scoring_job_in_flight = false
+        return
+    if _shadow_scoring_thread.is_alive():
+        return
+
+    var result = _shadow_scoring_thread.wait_to_finish()
+    _release_shadow_scoring_global_slot_if_needed()
+    _shadow_scoring_thread = null
+    _shadow_scoring_job_in_flight = false
+    jobs_completed += 1
+
+    _consume_shadow_scoring_payload_result(result)
+
+func _consume_shadow_scoring_payload_result(result):
+    if typeof(result) != TYPE_DICTIONARY:
+        return
+
+    var submit_frame = int(result.get("submit_frame", -1))
+    if submit_frame <= _shadow_scoring_last_consumed_submit_frame:
+        jobs_dropped_stale += 1
+        return
+
+    _shadow_scoring_last_consumed_submit_frame = submit_frame
+    _shadow_scoring_latest_result = result
+    _compare_shadow_scoring_with_authoritative(result)
+    _log_shadow_scoring_stats_if_enabled()
+
+func _build_shadow_scoring_payload() -> Dictionary:
+    var candidates = []
+    var candidate_cap = max(1, int(EnemyAISettings.threaded_scoring_candidate_cap))
+    var now_msec = int(Time.get_ticks_msec())
+    var submit_frame = int(Engine.get_process_frames())
+    var self_pos = global_position
+    var forward = -global_transform.basis.z.normalized()
+
+    if _can_target_player() and playerVisible:
+        var player_pos = playerPosition
+        var player_dist = self_pos.distance_to(player_pos)
+        var player_dir = (player_pos - self_pos).normalized()
+        candidates.append({
+            "candidate_id": THREADED_SCORING_PLAYER_ID,
+            "candidate_type": "player",
+            "distance": player_dist,
+            "forward_dot": forward.dot(player_dir),
+            "is_visible": true
+        })
+
+    if candidates.size() < candidate_cap:
+        for child in _get_active_agent_candidates():
+            if !_is_valid_hostile_ai_target(child):
+                continue
+
+            var ai_pos = _get_ai_target_position(child)
+            var ai_dist = self_pos.distance_to(ai_pos)
+            var ai_dir = (ai_pos - self_pos).normalized()
+            candidates.append({
+                "candidate_id": int(child.get_instance_id()),
+                "candidate_type": "ai",
+                "distance": ai_dist,
+                "forward_dot": forward.dot(ai_dir),
+                "is_hostile": true,
+                "is_visible": true,
+                "audible": _target_is_audible(child, ai_dist),
+                "shot_recent": _target_fired_recently(child)
+            })
+            if candidates.size() >= candidate_cap:
+                break
+
+    return {
+        "job_id": _shadow_scoring_next_job_id,
+        "submit_frame": submit_frame,
+        "submit_time_msec": now_msec,
+        "self_instance_id": int(get_instance_id()),
+        "target_scan_max_distance": TARGET_SCAN_MAX_DISTANCE,
+        "target_scan_min_dot": TARGET_SCAN_MIN_DOT,
+        "top_k": max(1, int(EnemyAISettings.threaded_scoring_top_k)),
+        "candidates": candidates
+    }
+
+func _shadow_scoring_worker(payload: Dictionary) -> Dictionary:
+    var ranked = []
+    var top_k = max(1, int(payload.get("top_k", 3)))
+    var processed = 0
+    var rejected_distance = 0
+    var rejected_fov = 0
+    var rejected_visibility = 0
+    var rejected_type_gate = 0
+    var max_distance = float(payload.get("target_scan_max_distance", TARGET_SCAN_MAX_DISTANCE))
+    var min_dot = float(payload.get("target_scan_min_dot", TARGET_SCAN_MIN_DOT))
+
+    for candidate in payload.get("candidates", []):
+        processed += 1
+
+        var candidate_type = str(candidate.get("candidate_type", "none"))
+        var candidate_id = int(candidate.get("candidate_id", -1))
+        var distance = float(candidate.get("distance", INF))
+        var forward_dot = float(candidate.get("forward_dot", -1.0))
+        var flags = []
+
+        if distance > max_distance:
+            rejected_distance += 1
+            continue
+        if forward_dot < min_dot:
+            rejected_fov += 1
+            continue
+
+        var score = -1.0
+        if candidate_type == "ai":
+            if !bool(candidate.get("is_hostile", false)):
+                rejected_type_gate += 1
+                continue
+            if !bool(candidate.get("is_visible", false)):
+                rejected_visibility += 1
+                continue
+            score = 3.0 / (1.0 + distance)
+            flags.append("hostile")
+            flags.append("visible")
+            if bool(candidate.get("audible", false)):
+                flags.append("audible")
+            if bool(candidate.get("shot_recent", false)):
+                flags.append("shot_recent")
+        elif candidate_type == "player":
+            if !bool(candidate.get("is_visible", false)):
+                rejected_visibility += 1
+                continue
+            score = 2.0 * absf(forward_dot) / (1.0 + distance)
+            if score == 0.0:
+                score = 0.1
+            flags.append("player_visible")
+        else:
+            rejected_type_gate += 1
+            continue
+
+        ranked.append({
+            "candidate_id": candidate_id,
+            "candidate_type": candidate_type,
+            "score": score,
+            "distance": distance,
+            "forward_dot": forward_dot,
+            "reason_flags": flags
+        })
+
+    ranked.sort_custom(func(a, b): return float(a.get("score", -INF)) > float(b.get("score", -INF)))
+    if ranked.size() > top_k:
+        ranked = ranked.slice(0, top_k)
+
+    return {
+        "job_id": int(payload.get("job_id", -1)),
+        "submit_frame": int(payload.get("submit_frame", -1)),
+        "submit_time_msec": int(payload.get("submit_time_msec", 0)),
+        "processed": processed,
+        "ranked": ranked,
+        "summary_flags": {
+            "rejected_distance": rejected_distance,
+            "rejected_fov": rejected_fov,
+            "rejected_visibility": rejected_visibility,
+            "rejected_type_gate": rejected_type_gate
+        }
+}
+
+func _compare_shadow_scoring_with_authoritative(result: Dictionary):
+    var ranked = result.get("ranked", [])
+    if ranked.is_empty():
+        return
+
+    var top = ranked[0]
+    var shadow_type = str(top.get("candidate_type", "none"))
+    var shadow_id = int(top.get("candidate_id", -1))
+
+    var authoritative_type = current_target_type
+    var authoritative_id = -1
+    if authoritative_type == "ai" and is_instance_valid(currentAITarget):
+        authoritative_id = int(currentAITarget.get_instance_id())
+    elif authoritative_type == "player":
+        authoritative_id = THREADED_SCORING_PLAYER_ID
+
+    if shadow_type != authoritative_type or shadow_id != authoritative_id:
+        _trace_log(
+            "shadow_target_mismatch",
+            "Shadow mismatch self=%d job=%d frame=%d shadow=%s:%d authoritative=%s:%d" % [
+                int(get_instance_id()),
+                int(result.get("job_id", -1)),
+                int(result.get("submit_frame", -1)),
+                shadow_type,
+                shadow_id,
+                authoritative_type,
+                authoritative_id
+            ],
+            TRACE_HOSTILITY_COOLDOWN
+        )
+
+func _log_shadow_scoring_stats_if_enabled():
+    if !EnemyAISettings.show_threaded_scoring_stats:
+        return
+    DebugUtils._debug_log_rate_limited(
+        "shadow_scoring_stats_%s" % str(get_instance_id()),
+        "Shadow scoring stats submitted=%d completed=%d stale=%d in_flight=%s active_job=%d frame=%d submitted_at=%d" % [
+            jobs_submitted,
+            jobs_completed,
+            jobs_dropped_stale,
+            str(_shadow_scoring_job_in_flight),
+            _shadow_scoring_active_job_id,
+            _shadow_scoring_active_submit_frame,
+            _shadow_scoring_active_submit_time_msec
+        ],
+        2.0
+    )
+
+func _clear_shadow_scoring_runtime_state(wait_for_in_flight_job: bool):
+    if _shadow_scoring_thread != null and _shadow_scoring_job_in_flight:
+        if wait_for_in_flight_job:
+            _shadow_scoring_thread.wait_to_finish()
+            _release_shadow_scoring_global_slot_if_needed()
+            _shadow_scoring_thread = null
+            _shadow_scoring_job_in_flight = false
+        else:
+            _shadow_scoring_latest_result = {}
+            return
+    else:
+        _release_shadow_scoring_global_slot_if_needed()
+        _shadow_scoring_thread = null
+        _shadow_scoring_job_in_flight = false
+
+    _shadow_scoring_active_job_id = 0
+    _shadow_scoring_active_submit_frame = -1
+    _shadow_scoring_active_submit_time_msec = 0
+    _shadow_scoring_last_consumed_submit_frame = -1
+    _shadow_scoring_latest_result = {}
+
+func _on_tree_exited_shadow_scoring_cleanup():
+    _clear_shadow_scoring_runtime_state(true)
 
 func _current_target_refresh_cycle() -> float:
     var active_count = _active_ai_count()
@@ -872,7 +1285,7 @@ func _current_target_refresh_cycle() -> float:
         base_cycle = 0.58 + targetRefreshJitter
 
     if _has_stable_visible_ai_target():
-        return max(0.25, base_cycle * 0.72)
+        return max(0.52, base_cycle * 1.55)
     if !_has_valid_ai_target():
         return base_cycle * 1.25
 
@@ -907,7 +1320,7 @@ func _current_target_visibility_cycle() -> float:
         if currentAITargetDistance > 50.0:
             return base_cycle * 1.35
         if currentAITargetDistance < 20.0:
-            return max(0.1, base_cycle * 0.85)
+            return max(0.16, base_cycle * 1.05)
 
     return base_cycle
 
@@ -979,7 +1392,7 @@ func _find_audible_hostile_target() -> Node3D:
     var nearest_target: Node3D = null
     var nearest_distance = 9999.0
 
-    for child in AISpawner.agents.get_children():
+    for child in _get_active_agent_candidates():
         if !_is_valid_hostile_ai_target(child):
             continue
 
@@ -1037,10 +1450,12 @@ func _mark_ai_gunshot():
     set_meta("enemy_ai_last_shot_time", float(Time.get_ticks_msec()) / 1000.0)
 
 func _acquire_best_target():
+    var self_pos = global_position
     var forward = -global_transform.basis.z.normalized()
-    var best_ai_score = -1.0
+    var max_distance_sq = TARGET_SCAN_MAX_DISTANCE * TARGET_SCAN_MAX_DISTANCE
     var best_ai_node: Node3D = null
     var best_ai_position = Vector3.ZERO
+    var best_ai_distance_sq = INF
     var best_ai_distance = INF
     var scanned_ai = 0
     var hostile_candidates = 0
@@ -1050,18 +1465,22 @@ func _acquire_best_target():
 
     if is_instance_valid(AISpawner) and is_instance_valid(AISpawner.agents):
         local_agents = AISpawner.agents.get_child_count()
-        for child in AISpawner.agents.get_children():
+        for child in _get_active_agent_candidates():
             scanned_ai += 1
             if !_is_valid_hostile_ai_target(child):
                 continue
             hostile_candidates += 1
 
             var ai_pos = _get_ai_target_position(child)
-            var ai_dist = global_position.distance_to(ai_pos)
-            if ai_dist > TARGET_SCAN_MAX_DISTANCE:
+            var to_ai = ai_pos - self_pos
+            var ai_dist_sq = to_ai.length_squared()
+            if ai_dist_sq > max_distance_sq:
+                continue
+            if ai_dist_sq >= best_ai_distance_sq:
                 continue
 
-            var ai_dir = (ai_pos - global_position).normalized()
+            var ai_dist = sqrt(ai_dist_sq)
+            var ai_dir = to_ai / max(ai_dist, 0.001)
             if forward.dot(ai_dir) < TARGET_SCAN_MIN_DOT:
                 continue
 
@@ -1071,6 +1490,7 @@ func _acquire_best_target():
 
             visible_hostile_candidates += 1
             if ai_dist < best_ai_distance:
+                best_ai_distance_sq = ai_dist_sq
                 best_ai_position = ai_pos
                 best_ai_distance = ai_dist
                 best_ai_node = child
@@ -1082,21 +1502,17 @@ func _acquire_best_target():
     var best_score = -1.0
 
     if is_instance_valid(best_ai_node):
-        best_ai_score = 3.0 / (1.0 + best_ai_distance)
         best_type = "ai"
         best_position = best_ai_position
         best_distance = best_ai_distance
         best_node = best_ai_node
-        best_score = best_ai_score
+        best_score = 3.0 / (1.0 + best_ai_distance)
     elif _can_target_player() and playerVisible:
         var player_pos = playerPosition
-        var player_dist = global_position.distance_to(player_pos)
-        var player_dir = (player_pos - global_position).normalized()
-        var player_angle = acos(clamp(forward.dot(player_dir), -1.0, 1.0))
-        var player_score = 2.0 * cos(player_angle) / (1.0 + player_dist)
-        if player_score < 0.0:
-            player_score = -player_score
-        elif player_score == 0.0:
+        var player_dist = self_pos.distance_to(player_pos)
+        var player_dir = (player_pos - self_pos).normalized()
+        var player_score = 2.0 * absf(forward.dot(player_dir)) / (1.0 + player_dist)
+        if player_score == 0.0:
             player_score = 0.1
         best_score = player_score
         best_type = "player"
@@ -1338,20 +1754,20 @@ func _normalize_faction_name(faction: String) -> String:
             return faction
 
 func _is_valid_teammate_target(target_position: Vector3, target_type: String, target_node: Node3D = null) -> bool:
-    var distance = global_position.distance_to(target_position)
+    var distance_sq = global_position.distance_squared_to(target_position)
 
     if target_type == "ai" or target_type in ["audio_ai_gunshot", "audio_ai_running", "audio_ai_walking", "audio_ai_unknown"]:
         if target_node == null:
             return false
         if !_is_valid_hostile_ai_target(target_node):
             return false
-        return distance <= 100.0
+        return distance_sq <= TEAMMATE_TARGET_VALID_DISTANCE_SQ
     elif target_type == "player" or target_type in ["audio_player_running", "audio_player_walking", "audio_player_gunshot"]:
         if gameData.isDead:
             return false
         if !_can_target_player():
             return false
-        return distance <= 100.0
+        return distance_sq <= TEAMMATE_TARGET_VALID_DISTANCE_SQ
     else:
         return false
 
@@ -1388,13 +1804,17 @@ func _can_see_ai_target(target_node: Node3D) -> bool:
 
     var target_position = _get_ai_target_position(target_node)
     var sight_multiplier = max(0.1, EnemyAISettings.ai_sight_multiplier)
+    var sight_range = 200.0 * sight_multiplier
 
     if gameData.TOD == 4 and !gameData.flashlight and !boss:
-        LOS.target_position = Vector3(0, 0, (25 + extraVisibility) * sight_multiplier)
+        sight_range = (25 + extraVisibility) * sight_multiplier
     elif gameData.fog and !boss:
-        LOS.target_position = Vector3(0, 0, (100 + extraVisibility) * sight_multiplier)
-    else:
-        LOS.target_position = Vector3(0, 0, 200 * sight_multiplier)
+        sight_range = (100 + extraVisibility) * sight_multiplier
+
+    if LOS.global_position.distance_squared_to(target_position) > sight_range * sight_range:
+        return false
+
+    LOS.target_position = Vector3(0, 0, sight_range)
 
     LOS.look_at(target_position, Vector3.UP, true)
     LOS.force_raycast_update()
@@ -1560,9 +1980,17 @@ func _self_or_target_faction_name(target_node: Node3D) -> String:
 func _push_debug_status(event_text: String):
     if !EnemyAISettings.show_debug_overlay and !EnemyAISettings.show_debug_logs:
         return
+    var now_seconds = Time.get_ticks_msec() / 1000.0
+    var same_event = event_text == _last_debug_status_event
+    var same_target = targetLabel == _last_debug_status_target
+    if same_event and same_target and now_seconds - _last_debug_status_push_time < 0.25:
+        return
 
     var debug_main = get_node_or_null("/root/EnemyAIMain")
     if debug_main:
+        _last_debug_status_push_time = now_seconds
+        _last_debug_status_event = event_text
+        _last_debug_status_target = targetLabel
         debug_main.update_status(AISpawner.activeAgents, {
             "last_event": event_text,
             "current_target": targetLabel
@@ -1670,6 +2098,8 @@ func _broadcast_target_to_teammates(target_position: Vector3, target_type: Strin
     var cooldown_timer = broadcastCooldownPlayer if is_player_target else broadcastCooldownAI
     if cooldown_timer > 0:
         return
+    if _should_skip_duplicate_teammate_broadcast(target_position, target_type, target_node, quality):
+        return
     if !is_instance_valid(AISpawner) or !is_instance_valid(AISpawner.agents):
         return
 
@@ -1678,7 +2108,7 @@ func _broadcast_target_to_teammates(target_position: Vector3, target_type: Strin
     if AISpawner.agents.get_child_count() > 64:
         return
 
-    var teammates = AISpawner.agents.get_children()
+    var teammates = _get_teammate_candidates(self_faction)
     for child in teammates:
         if child == self:
             continue
@@ -1689,8 +2119,8 @@ func _broadcast_target_to_teammates(target_position: Vector3, target_type: Strin
         if !child.has_meta("enemy_ai_faction") or _normalize_faction_name(str(child.get_meta("enemy_ai_faction"))) != self_faction:
             continue
 
-        var distance = global_position.distance_to(child.global_position)
-        if distance > 50.0:  # broadcast range
+        var distance_sq = global_position.distance_squared_to(child.global_position)
+        if distance_sq > TEAMMATE_BROADCAST_RANGE_SQ:  # broadcast range
             continue
 
         # Inform the teammate
@@ -1701,6 +2131,7 @@ func _broadcast_target_to_teammates(target_position: Vector3, target_type: Strin
         broadcastCooldownPlayer = 2.0
     else:
         broadcastCooldownAI = 2.0
+    _record_teammate_broadcast(target_position, target_type, target_node, quality)
 
 func _receive_teammate_target_info(target_position: Vector3, target_type: String, target_node: Node3D = null, quality: QualityTier = QualityTier.AUDIO):
     # Validate target before adopting
@@ -1711,12 +2142,12 @@ func _receive_teammate_target_info(target_position: Vector3, target_type: String
     var is_audio = target_type.begins_with("audio_")
     var is_player_target = target_type == "player" or target_type.begins_with("audio_player")
     var is_ai_target = target_type == "ai" or target_type.begins_with("audio_ai")
-    var distance = global_position.distance_to(target_position)
+    var distance_sq = global_position.distance_squared_to(target_position)
 
     if is_player_target and playerVisible and current_target_type == "player":
         return
     if is_player_target and current_target_type == "player" and current_target_quality <= quality and _is_last_known_location_valid():
-        if _last_known_location_data.position.distance_to(target_position) < 1.5:
+        if _last_known_location_data.position.distance_squared_to(target_position) < TEAMMATE_DUPLICATE_POSITION_EPSILON_SQ:
             return
     if is_ai_target and current_target_type == "ai" and current_target_quality <= quality and is_instance_valid(target_node):
         if currentAITarget == target_node:
@@ -1740,6 +2171,7 @@ func _receive_teammate_target_info(target_position: Vector3, target_type: String
             should_switch = true
 
     if should_switch:
+        var distance = sqrt(distance_sq)
         if is_player_target:
             _clear_ai_target()
             current_target_type = "player"
@@ -1765,7 +2197,11 @@ func _receive_teammate_target_info(target_position: Vector3, target_type: String
             if is_gunshot:
                 ChangeState("Combat")
             else:
-                Decision()
+                var now_seconds = Time.get_ticks_msec() / 1000.0
+                var decision_debounce = max(0.0, float(EnemyAISettings.teammate_decision_debounce_seconds))
+                if now_seconds - _last_teammate_decision_time >= decision_debounce:
+                    _last_teammate_decision_time = now_seconds
+                    Decision()
 
 func _count_teammates_targeting_same() -> int:
     if !is_instance_valid(AISpawner) or !is_instance_valid(AISpawner.agents):
@@ -1776,7 +2212,7 @@ func _count_teammates_targeting_same() -> int:
     var self_faction = _self_faction()
     var count = 0
 
-    var teammates = AISpawner.agents.get_children()
+    var teammates = _get_teammate_candidates(self_faction)
     for child in teammates:
         if child == self:
             continue

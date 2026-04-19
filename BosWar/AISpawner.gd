@@ -11,6 +11,14 @@ var factionPool: Array = []
 var occupied_spawn_points_by_team: Dictionary = {}
 var initial_spawn_remaining: int = -1
 
+const AGENT_COHORT_CACHE_REFRESH_INTERVAL = 0.5
+var _agent_cohort_cache_elapsed: float = 0.0
+var _active_agents_by_faction_cache: Dictionary = {}
+var _active_agents_by_team_cache: Dictionary = {}
+var _active_agents_snapshot_cache: Array = []
+var _active_team_member_counts: Dictionary = {}
+var _spawn_point_static_validity_cache: Dictionary = {}
+
 
 # Initial rush mode variables for burst spawning
 var initial_rush_mode: bool
@@ -55,6 +63,22 @@ func _is_spawn_point_valid(spawn_point: Node3D) -> bool:
         return false
 
     return true
+
+func _refresh_spawn_point_static_validity_cache():
+    var new_cache: Dictionary = {}
+    for spawn_point in spawns:
+        if !is_instance_valid(spawn_point):
+            continue
+        new_cache[int(spawn_point.get_instance_id())] = _is_spawn_point_valid(spawn_point)
+    _spawn_point_static_validity_cache = new_cache
+
+func _is_spawn_point_static_valid(spawn_point: Node3D) -> bool:
+    if !is_instance_valid(spawn_point):
+        return false
+    var spawn_id = int(spawn_point.get_instance_id())
+    if !_spawn_point_static_validity_cache.has(spawn_id):
+        return _is_spawn_point_valid(spawn_point)
+    return bool(_spawn_point_static_validity_cache.get(spawn_id, false))
 
 func _sample_floor_at_position(base_position: Vector3, exclude_nodes: Array = []) -> Dictionary:
     var origin = base_position + Vector3(0, SPAWN_AUDIT_RAY_ABOVE, 0)
@@ -214,11 +238,13 @@ func _resolve_safe_spawn_position(spawn_point: Node3D, blocked_positions: Array 
 
 func _get_valid_spawn_points() -> Array:
     var valid_points = []
+    if _spawn_point_static_validity_cache.is_empty() and !spawns.is_empty():
+        _refresh_spawn_point_static_validity_cache()
     for spawn_point in spawns:
         var distance_to_player = spawn_point.global_position.distance_to(gameData.playerPosition)
         if distance_to_player <= spawnDistance:
             continue
-        if not _is_spawn_point_valid(spawn_point):
+        if not _is_spawn_point_static_valid(spawn_point):
             continue
         if EnemyAISettings.enable_team_spawning and occupied_spawn_points_by_team.values().has(spawn_point):
             continue
@@ -229,6 +255,7 @@ func _get_valid_spawn_points() -> Array:
 func _ready():
     GetPoints()
     HidePoints()
+    _refresh_spawn_point_static_validity_cache()
 
     active = true
     spawnDistance = EnemyAISettings.spawn_distance
@@ -273,9 +300,16 @@ func _ready():
         else:
             DebugUtils._debug_log("Initial hider roll failed")
 
+    _refresh_active_agent_cohort_cache()
+
 func _physics_process(delta):
     if !active:
         return
+
+    _agent_cohort_cache_elapsed += delta
+    if _agent_cohort_cache_elapsed >= AGENT_COHORT_CACHE_REFRESH_INTERVAL:
+        _agent_cohort_cache_elapsed = 0.0
+        _refresh_active_agent_cohort_cache()
 
     spawnTime -= delta
 
@@ -360,11 +394,11 @@ func _get_preset_profile() -> Dictionary:
             }
         _:  # Default/Low intensity - minimal threat
             return {
-                "spawn_limit": 12,        # Max 18 active enemies at once
+                "spawn_limit": 16,        # Max 16 active enemies at once
                 "spawn_pool": 36,        # Total of 32 enemies available to spawn
                 "initial_population": 4, # Start with 8 enemies
-                "spawn_min": 8.0,        # Spawn intervals: 10-45 seconds
-                "spawn_max": 48.0
+                "spawn_min": 15.0,       # Spawn intervals: 15-75 seconds
+                "spawn_max": 75.0
             }
 
 func _get_rate_scale() -> float:
@@ -1047,30 +1081,17 @@ func _check_and_release_defeated_team_spawn_points():
     if !EnemyAISettings.enable_team_spawning:
         return
 
-    # Count currently active teams by scanning all agents
-    var active_team_ids = {}
-    for agent in agents.get_children():
-        if !is_instance_valid(agent):
-            continue
-        if bool(agent.get("dead")):
-            continue
-        if bool(agent.get("pause")):
-            continue
-        if agent.has_meta("team_id"):
-            var team_id = agent.get_meta("team_id")
-            active_team_ids[team_id] = true
-
     # Release only reservations for teams that are no longer active
     var reserved_team_ids = occupied_spawn_points_by_team.keys()
     var released_count = 0
     for reserved_team_id in reserved_team_ids:
-        if active_team_ids.has(reserved_team_id):
+        if int(_active_team_member_counts.get(int(reserved_team_id), 0)) > 0:
             continue
         occupied_spawn_points_by_team.erase(reserved_team_id)
         released_count += 1
 
     if released_count > 0:
-        DebugUtils._debug_log("Released %d team spawn reservations (active teams: %d)" % [released_count, active_team_ids.size()])
+        DebugUtils._debug_log("Released %d team spawn reservations (active teams: %d)" % [released_count, _active_team_member_counts.size()])
 
 ## Creates and spawns a complete team at the specified spawn point
 ## Returns array of spawned agent nodes
@@ -1139,6 +1160,7 @@ func _spawn_team_at_location(faction_name: String, spawn_point: Node3D, team_id:
         if is_instance_valid(agent):
             var before = activeAgents
             activeAgents += 1
+            _active_team_member_counts[team_id] = int(_active_team_member_counts.get(team_id, 0)) + 1
             DebugUtils._debug_log("Team spawn increment: before=%d after=%d (team %d, faction %s)" % [before, activeAgents, team_id, faction_name])
         else:
             DebugUtils._debug_log("Team spawn failed: agent invalid after activation for team %d" % team_id)
@@ -1171,3 +1193,72 @@ func _log_faction_breakdown():
     ])
     if total_counted != activeAgents:
         DebugUtils._debug_log("WARNING: Faction total mismatch! Counted=%d, activeAgents=%d" % [total_counted, activeAgents])
+
+func _normalize_faction_key(faction_name: String) -> String:
+    return faction_name.strip_edges().to_lower()
+
+func _refresh_active_agent_cohort_cache() -> void:
+    var by_faction: Dictionary = {}
+    var by_team: Dictionary = {}
+    var team_counts: Dictionary = {}
+    var snapshot: Array = []
+
+    for agent in agents.get_children():
+        if !is_instance_valid(agent):
+            continue
+        if bool(agent.get("dead")):
+            continue
+        if bool(agent.get("pause")):
+            continue
+
+        snapshot.append(agent)
+
+        var faction_name = "Unknown"
+        if agent.has_meta("enemy_ai_faction"):
+            faction_name = str(agent.get_meta("enemy_ai_faction"))
+        var faction_key = _normalize_faction_key(faction_name)
+        if !by_faction.has(faction_key):
+            by_faction[faction_key] = []
+        by_faction[faction_key].append(agent)
+
+        if agent.has_meta("team_id"):
+            var team_id = int(agent.get_meta("team_id"))
+            if !by_team.has(team_id):
+                by_team[team_id] = []
+            by_team[team_id].append(agent)
+            team_counts[team_id] = int(team_counts.get(team_id, 0)) + 1
+
+    _active_agents_by_faction_cache = by_faction
+    _active_agents_by_team_cache = by_team
+    _active_agents_snapshot_cache = snapshot
+    _active_team_member_counts = team_counts
+
+func get_active_agents_by_faction(faction_name: String) -> Array:
+    var faction_key = _normalize_faction_key(faction_name)
+    if !_active_agents_by_faction_cache.has(faction_key):
+        return []
+    return (_active_agents_by_faction_cache[faction_key] as Array).duplicate()
+
+func get_active_agents_by_faction_ref(faction_name: String) -> Array:
+    var faction_key = _normalize_faction_key(faction_name)
+    if !_active_agents_by_faction_cache.has(faction_key):
+        return []
+    return _active_agents_by_faction_cache[faction_key]
+
+func get_active_agents_by_team(team_id: int) -> Array:
+    if !_active_agents_by_team_cache.has(team_id):
+        return []
+    return (_active_agents_by_team_cache[team_id] as Array).duplicate()
+
+func get_all_active_agents() -> Array:
+    return _active_agents_snapshot_cache.duplicate()
+
+func get_all_active_agents_ref() -> Array:
+    return _active_agents_snapshot_cache
+
+func get_active_agents_snapshot() -> Dictionary:
+    return {
+        "by_faction": _active_agents_by_faction_cache.duplicate(true),
+        "by_team": _active_agents_by_team_cache.duplicate(true),
+        "all_active_agents": _active_agents_snapshot_cache.duplicate()
+    }
