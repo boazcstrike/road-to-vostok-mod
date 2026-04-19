@@ -2,3 +2,6 @@ mods
 **/*.vmz
 **/*.zip
 Road to Vostok
+.omx
+.claude
+.opencode

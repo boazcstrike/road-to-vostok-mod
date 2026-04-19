@@ -50,6 +50,7 @@ func _ready():
     _override_script("res://BosWar/AI.gd")
     _override_script("res://BosWar/AISpawner.gd")
     _override_script("res://BosWar/Character.gd")
+    _override_script("res://BosWar/Loader.gd")
     call_deferred("_schedule_mcm_compatibility_patch")
     _ensure_debug_overlay()
 
@@ -152,7 +153,11 @@ func begin_map(map_name: String, zone_name: String, info: Dictionary = {}):
     _render_debug()
 
 func record_spawn(event_name: String, active_count: int, info: Dictionary = {}):
-    spawnedThisMap += 1
+    var spawn_count = int(info.get("spawn_count", 1))
+    if spawn_count < 1:
+        spawn_count = 1
+
+    spawnedThisMap += spawn_count
     activeAI = active_count
     spawnLimit = int(info.get("spawn_limit", spawnLimit))
     spawnPool = int(info.get("spawn_pool", spawnPool))
@@ -165,9 +170,9 @@ func record_spawn(event_name: String, active_count: int, info: Dictionary = {}):
     var factionName = str(info.get("spawn_faction", "Unknown"))
     var roleName = str(info.get("spawn_role", "Unknown"))
     if spawnCountsByFaction.has(factionName):
-        spawnCountsByFaction[factionName] += 1
+        spawnCountsByFaction[factionName] += spawn_count
     if spawnCountsByRole.has(roleName):
-        spawnCountsByRole[roleName] += 1
+        spawnCountsByRole[roleName] += spawn_count
     lastEvent = event_name
     _render_debug()
 
@@ -276,14 +281,15 @@ func _render_debug():
         spawnCountsByRole["Minion"],
         spawnCountsByRole["Boss"]
     ]
-    var hitSummary = "Deaths %d | Torso %d | Head %d | Legs %d | Root %d" % [
+    var hitSummary = "Deaths %d | Torso %d | Head %d | Legs %d | Other %d | Root %d" % [
         deathCount,
         hitCounts["Torso"],
         hitCounts["Head"],
         hitCounts["Legs"],
+        hitCounts["Other"],
         hitCounts["RootFallback"]
     ]
-    var spawnAuditSummary = "Suspicious Spawns %d" % suspiciousSpawnCount
+    var spawnAuditSummary = "Suspicious Spawn Events %d" % suspiciousSpawnCount
     var corpseSummary = "Corpses %d | Cleaned %d | Limit %d" % [
         corpseRecords.size(),
         corpseCleanupCount,
@@ -301,7 +307,7 @@ func _render_debug():
         "Spectator Invulnerable: %s" % spectatorStatus,
         "Current Target: %s" % currentTarget,
         "Spawned This Map: %d | Active AI: %d" % [spawnedThisMap, activeAI],
-        "Spawn Limit: %d | Spawn Pool: %d | Distance: %d" % [spawnLimit, spawnPool, spawnDistance],
+        "Spawn Limit: %d | Spawn Pool: %d | Distance: %dm" % [spawnLimit, spawnPool, spawnDistance],
         "Spawn Audit: %s" % spawnAuditSummary,
         "Corpse Cleanup: %s" % corpseSummary,
         "Combat Totals: %s" % hitSummary,

@@ -2,6 +2,7 @@ extends Node
 
 var enemyAISettings = preload("res://BosWar/EnemyAISettings.tres")
 var McmHelpers = load("res://ModConfigurationMenu/Scripts/Doink Oink/MCM_Helpers.tres")
+const DebugUtils = preload("res://BosWar/DebugUtils.gd")
 
 const FILE_PATH = "user://MCM/BosWar"
 const MOD_ID = "BosWar"
@@ -121,8 +122,8 @@ func _ready() -> void:
     config.set_value("Dropdown", "bandit_spawn_mode", {
         "name" = "Allow Bandits",
         "tooltip" = "Map Default keeps the map's normal faction setup. On forces bandits into the spawn mix, and Off removes them even if the map would normally use them.",
-        "default" = 1,
-        "value" = 1,
+        "default" = 0,
+        "value" = 0,
         "menu_pos" = 3,
         "options" = [
             "Map Default",
@@ -134,8 +135,8 @@ func _ready() -> void:
     config.set_value("Dropdown", "guard_spawn_mode", {
         "name" = "Allow Guards",
         "tooltip" = "Map Default keeps the map's normal faction setup. On forces guards into the spawn mix, and Off removes them even if the map would normally use them.",
-        "default" = 1,
-        "value" = 1,
+        "default" = 0,
+        "value" = 0,
         "menu_pos" = 4,
         "options" = [
             "Map Default",
@@ -147,8 +148,8 @@ func _ready() -> void:
     config.set_value("Dropdown", "military_spawn_mode", {
         "name" = "Allow Military",
         "tooltip" = "Map Default keeps the map's normal faction setup. On forces military into the spawn mix, and Off removes them even if the map would normally use them.",
-        "default" = 1,
-        "value" = 1,
+        "default" = 0,
+        "value" = 0,
         "menu_pos" = 5,
         "options" = [
             "Map Default",
@@ -169,8 +170,8 @@ func _ready() -> void:
     config.set_value("Bool", "guard_infighting_enabled", {
         "name" = "Enable Guard Infighting",
         "tooltip" = "Allows guards to treat other guards as enemies and fight each other.",
-        "default" = false,
-        "value" = false
+        "default" = true,
+        "value" = true
         ,
         "menu_pos" = 8
     })
@@ -178,8 +179,8 @@ func _ready() -> void:
     config.set_value("Bool", "military_infighting_enabled", {
         "name" = "Enable Military Infighting",
         "tooltip" = "Allows military units to treat other military units as enemies and fight each other.",
-        "default" = false,
-        "value" = false
+        "default" = true,
+        "value" = true
         ,
         "menu_pos" = 9
     })
@@ -235,13 +236,22 @@ func _ready() -> void:
         "menu_pos" = 22
     })
 
+    config.set_value("Bool", "show_debug_logs", {
+        "name" = "Enable AI Debug Logs",
+        "tooltip" = "Controls console/event debug logging for Bo's War systems. Turn this off for quieter runtime output.",
+        "default" = false,
+        "value" = false
+        ,
+        "menu_pos" = 23
+    })
+
     config.set_value("Bool", "replenish_spawn_pool", {
         "name" = "Replenish Spawn Pool",
         "tooltip" = "Keeps long sessions spawning by adding a fresh reserve enemy back into the pool when one dies.",
         "default" = true,
         "value" = true
         ,
-        "menu_pos" = 23
+        "menu_pos" = 24
     })
 
     config.set_value("Float", "ai_health_multiplier", {
@@ -370,13 +380,14 @@ func _on_config_updated(config: ConfigFile):
     enemyAISettings.guard_spawn_mode = config.get_value("Dropdown", "guard_spawn_mode")["value"]
     enemyAISettings.military_spawn_mode = config.get_value("Dropdown", "military_spawn_mode")["value"]
     enemyAISettings.warfare_enabled = config.get_value("Bool", "warfare_enabled")["value"]
-    enemyAISettings.bandit_infighting_enabled = config.get_value("Bool", "bandit_infighting_enabled", {"value": false})["value"]
-    enemyAISettings.guard_infighting_enabled = config.get_value("Bool", "guard_infighting_enabled", {"value": false})["value"]
-    enemyAISettings.military_infighting_enabled = config.get_value("Bool", "military_infighting_enabled", {"value": false})["value"]
+    enemyAISettings.bandit_infighting_enabled = config.get_value("Bool", "bandit_infighting_enabled", {"value": true})["value"]
+    enemyAISettings.guard_infighting_enabled = config.get_value("Bool", "guard_infighting_enabled", {"value": true})["value"]
+    enemyAISettings.military_infighting_enabled = config.get_value("Bool", "military_infighting_enabled", {"value": true})["value"]
     enemyAISettings.player_faction_alignment = config.get_value("Dropdown", "player_faction_alignment", {"value": 0})["value"]
     enemyAISettings.corpse_cleanup_limit = config.get_value("Int", "corpse_cleanup_limit", {"value": 20})["value"]
     enemyAISettings.player_invulnerable = config.get_value("Bool", "player_invulnerable", {"value": false})["value"]
     enemyAISettings.show_debug_overlay = config.get_value("Bool", "show_debug_overlay")["value"]
+    enemyAISettings.show_debug_logs = config.get_value("Bool", "show_debug_logs", {"value": true})["value"]
     enemyAISettings.replenish_spawn_pool = config.get_value("Bool", "replenish_spawn_pool", {"value": true})["value"]
     enemyAISettings.ai_health_multiplier = config.get_value("Float", "ai_health_multiplier")["value"]
     enemyAISettings.boss_health_multiplier = config.get_value("Float", "boss_health_multiplier")["value"]
@@ -540,5 +551,12 @@ func _sync_saved_mod_version(config: ConfigFile) -> bool:
         return false
 
     config.set_value("Meta", "mod_version", MOD_VERSION)
-    print("[EnemyAI] Updated saved mod version from '%s' to '%s' without changing player settings." % [saved_version, MOD_VERSION])
+    var should_log_debug = true
+    if config.has_section_key("Bool", "show_debug_logs"):
+        var log_entry = config.get_value("Bool", "show_debug_logs", {"value": true})
+        if log_entry is Dictionary and log_entry.has("value"):
+            should_log_debug = bool(log_entry["value"])
+
+    if should_log_debug:
+        DebugUtils._debug_log("Updated saved mod version from '%s' to '%s' without changing player settings." % [saved_version, MOD_VERSION])
     return true

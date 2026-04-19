@@ -8,7 +8,8 @@ var currentFactionName = "N/A"
 var factionPool: Array = []
 # Tracks spawn points that are currently occupied by active teams
 # Prevents different teams from spawning at the same location
-var occupied_spawn_points: Array = []
+var occupied_spawn_points_by_team: Dictionary = {}
+var initial_spawn_remaining: int = -1
 
 
 # Initial rush mode variables for burst spawning
@@ -22,30 +23,194 @@ const SPAWN_AUDIT_RAY_ABOVE = 3.0
 const SPAWN_AUDIT_RAY_BELOW = 20.0
 const SPAWN_AUDIT_BELOW_FLOOR_THRESHOLD = 2.5
 const SPAWN_AUDIT_ABOVE_FLOOR_THRESHOLD = 6.0
+const SPAWN_FLOOR_MIN_NORMAL_Y = 0.55
+const SPAWN_CLEARANCE_RADIUS = 0.30
+const SPAWN_CLEARANCE_HEIGHT = 1.40
+const SPAWN_CLEARANCE_CENTER_Y = 1.20
+const SPAWN_WALL_PROBE_HEIGHT = 1.10
+const SPAWN_WALL_PROBE_DISTANCE = 0.45
+const SPAWN_TEAM_MEMBER_MIN_SPACING = 0.70
+const SPAWN_RESOLVE_RING_RADIUS = 2.40
+const SPAWN_RESOLVE_RING_COUNT = 8
+const SPAWN_RESOLVE_INNER_RING_RADIUS = 1.20
+const SPAWN_RESOLVE_INNER_RING_COUNT = 4
 
 func _is_spawn_point_valid(spawn_point: Node3D) -> bool:
-    var origin = spawn_point.global_position + Vector3(0, SPAWN_AUDIT_RAY_ABOVE, 0)
-    var destination = spawn_point.global_position + Vector3(0, -SPAWN_AUDIT_RAY_BELOW, 0)
-    var query = PhysicsRayQueryParameters3D.create(origin, destination)
-    query.exclude = [spawn_point]
-
-    var result = get_world_3d().direct_space_state.intersect_ray(query)
-    if result.is_empty():
-        DebugUtils._debug_log("Spawn point '%s' invalid: no floor detected at position %s" % [spawn_point.name, str(spawn_point.global_position)])
+    var floor_sample = _sample_floor_at_position(spawn_point.global_position, [spawn_point])
+    if !bool(floor_sample.get("valid", false)):
+        DebugUtils._debug_log("Spawn point '%s' invalid: %s at position %s" % [
+            spawn_point.name,
+            str(floor_sample.get("reason", "no_floor_hit")),
+            str(spawn_point.global_position)
+        ])
         return false
 
-    var floor_y = float(result.position.y)
-    var delta_y = floor_y - spawn_point.global_position.y
-
-    if delta_y > SPAWN_AUDIT_BELOW_FLOOR_THRESHOLD:
-        DebugUtils._debug_log("Spawn point '%s' invalid: below floor surface (delta_y=%.2f) at position %s" % [spawn_point.name, delta_y, str(spawn_point.global_position)])
-        return false
-
-    if delta_y < -SPAWN_AUDIT_ABOVE_FLOOR_THRESHOLD:
-        DebugUtils._debug_log("Spawn point '%s' invalid: floating above floor (delta_y=%.2f) at position %s" % [spawn_point.name, delta_y, str(spawn_point.global_position)])
+    var safe_spawn = _resolve_safe_spawn_position(spawn_point)
+    if !bool(safe_spawn.get("valid", false)):
+        DebugUtils._debug_log("Spawn point '%s' invalid: %s at position %s" % [
+            spawn_point.name,
+            str(safe_spawn.get("reason", "no_safe_position_near_spawn_point")),
+            str(spawn_point.global_position)
+        ])
         return false
 
     return true
+
+func _sample_floor_at_position(base_position: Vector3, exclude_nodes: Array = []) -> Dictionary:
+    var origin = base_position + Vector3(0, SPAWN_AUDIT_RAY_ABOVE, 0)
+    var destination = base_position + Vector3(0, -SPAWN_AUDIT_RAY_BELOW, 0)
+    var query = PhysicsRayQueryParameters3D.create(origin, destination)
+    query.exclude = exclude_nodes
+
+    var result = get_world_3d().direct_space_state.intersect_ray(query)
+    if result.is_empty():
+        return {
+            "valid": false,
+            "reason": "no_floor_hit"
+        }
+
+    var floor_y = float(result.position.y)
+    var floor_normal_y = float(result.normal.y)
+    var delta_y = floor_y - base_position.y
+
+    if floor_normal_y < SPAWN_FLOOR_MIN_NORMAL_Y:
+        return {
+            "valid": false,
+            "reason": "steep_floor_normal",
+            "floor_y": floor_y,
+            "delta_y": delta_y,
+            "floor_normal_y": floor_normal_y
+        }
+
+    if delta_y > SPAWN_AUDIT_BELOW_FLOOR_THRESHOLD:
+        return {
+            "valid": false,
+            "reason": "below_floor_surface",
+            "floor_y": floor_y,
+            "delta_y": delta_y,
+            "floor_normal_y": floor_normal_y
+        }
+
+    if delta_y < -SPAWN_AUDIT_ABOVE_FLOOR_THRESHOLD:
+        return {
+            "valid": false,
+            "reason": "floating_above_floor",
+            "floor_y": floor_y,
+            "delta_y": delta_y,
+            "floor_normal_y": floor_normal_y
+        }
+
+    return {
+        "valid": true,
+        "reason": "ok",
+        "position": Vector3(base_position.x, floor_y, base_position.z),
+        "floor_y": floor_y,
+        "delta_y": delta_y,
+        "floor_normal_y": floor_normal_y
+    }
+
+func _build_spawn_candidate_offsets() -> Array:
+    var offsets: Array = [Vector3.ZERO]
+
+    for i in range(SPAWN_RESOLVE_INNER_RING_COUNT):
+        var angle_inner = (TAU / float(SPAWN_RESOLVE_INNER_RING_COUNT)) * float(i)
+        offsets.append(Vector3(cos(angle_inner), 0, sin(angle_inner)) * SPAWN_RESOLVE_INNER_RING_RADIUS)
+
+    for i in range(SPAWN_RESOLVE_RING_COUNT):
+        var angle_outer = (TAU / float(SPAWN_RESOLVE_RING_COUNT)) * float(i)
+        offsets.append(Vector3(cos(angle_outer), 0, sin(angle_outer)) * SPAWN_RESOLVE_RING_RADIUS)
+
+    return offsets
+
+func _has_minimum_spawn_spacing(candidate_position: Vector3, blocked_positions: Array, minimum_distance: float) -> bool:
+    for other_position in blocked_positions:
+        if candidate_position.distance_to(other_position) < minimum_distance:
+            return false
+    return true
+
+func _find_spawn_overlap(candidate_position: Vector3, exclude_nodes: Array = []) -> Dictionary:
+    var shape = CapsuleShape3D.new()
+    shape.radius = SPAWN_CLEARANCE_RADIUS
+    shape.height = SPAWN_CLEARANCE_HEIGHT
+
+    var query = PhysicsShapeQueryParameters3D.new()
+    query.shape = shape
+    query.transform = Transform3D(Basis.IDENTITY, candidate_position + Vector3(0, SPAWN_CLEARANCE_CENTER_Y, 0))
+    query.exclude = exclude_nodes
+    query.collide_with_bodies = true
+    query.collide_with_areas = false
+    query.margin = 0.02
+
+    var overlaps = get_world_3d().direct_space_state.intersect_shape(query, 4)
+    if !overlaps.is_empty():
+        var collider = overlaps[0].get("collider", null)
+        var collider_name = "unknown"
+        if is_instance_valid(collider):
+            collider_name = collider.name
+        return {
+            "blocked": true,
+            "reason": "inside_blocking_geometry",
+            "collider_name": collider_name
+        }
+
+    var probe_origin = candidate_position + Vector3(0, SPAWN_WALL_PROBE_HEIGHT, 0)
+    var probe_dirs = [
+        Vector3.FORWARD,
+        Vector3.BACK,
+        Vector3.LEFT,
+        Vector3.RIGHT
+    ]
+    for direction in probe_dirs:
+        var probe_query = PhysicsRayQueryParameters3D.create(
+            probe_origin,
+            probe_origin + (direction * SPAWN_WALL_PROBE_DISTANCE)
+        )
+        probe_query.exclude = exclude_nodes
+        var probe_result = get_world_3d().direct_space_state.intersect_ray(probe_query)
+        if !probe_result.is_empty():
+            var wall_collider = probe_result.get("collider", null)
+            var wall_collider_name = "unknown"
+            if is_instance_valid(wall_collider):
+                wall_collider_name = wall_collider.name
+            return {
+                "blocked": true,
+                "reason": "too_close_to_wall_or_prop",
+                "collider_name": wall_collider_name
+            }
+
+    return {
+        "blocked": false,
+        "reason": "ok"
+    }
+
+func _resolve_safe_spawn_position(spawn_point: Node3D, blocked_positions: Array = []) -> Dictionary:
+    var offsets = _build_spawn_candidate_offsets()
+    var exclude_nodes: Array = [spawn_point]
+
+    for offset in offsets:
+        var base_position = spawn_point.global_position + offset
+        var floor_sample = _sample_floor_at_position(base_position, exclude_nodes)
+        if !bool(floor_sample.get("valid", false)):
+            continue
+
+        var candidate_position = floor_sample.get("position", base_position)
+        if !_has_minimum_spawn_spacing(candidate_position, blocked_positions, SPAWN_TEAM_MEMBER_MIN_SPACING):
+            continue
+
+        var overlap = _find_spawn_overlap(candidate_position, exclude_nodes)
+        if bool(overlap.get("blocked", false)):
+            continue
+
+        return {
+            "valid": true,
+            "reason": "ok",
+            "position": candidate_position
+        }
+
+    return {
+        "valid": false,
+        "reason": "no_safe_position_near_spawn_point"
+    }
 
 func _get_valid_spawn_points() -> Array:
     var valid_points = []
@@ -55,7 +220,7 @@ func _get_valid_spawn_points() -> Array:
             continue
         if not _is_spawn_point_valid(spawn_point):
             continue
-        if EnemyAISettings.enable_team_spawning and occupied_spawn_points.has(spawn_point):
+        if EnemyAISettings.enable_team_spawning and occupied_spawn_points_by_team.values().has(spawn_point):
             continue
         valid_points.append(spawn_point)
     return valid_points
@@ -65,9 +230,6 @@ func _ready():
     GetPoints()
     HidePoints()
 
-    var valid_count = _get_valid_spawn_points().size()
-    DebugUtils._debug_log("Valid spawn points: %d/%d" % [valid_count, spawns.size()])
-
     active = true
     spawnDistance = EnemyAISettings.spawn_distance
     spawnLimit = _get_spawn_limit()
@@ -75,6 +237,9 @@ func _ready():
     initialGuard = EnemyAISettings.initial_guard
     initialHider = EnemyAISettings.initial_hider
     noHiding = EnemyAISettings.disable_hiding
+
+    var valid_count = _get_valid_spawn_points().size()
+    DebugUtils._debug_log("Valid spawn points: %d/%d" % [valid_count, spawns.size()])
     # initial_rush_mode = true  # Start in rush mode for fast initial population
     # initial_burst_duration = 5.0 * 60.0  # 5 minutes of initial burst
     # initial_burst_limit = spawnLimit * 2  # Allow up to 2x spawn limit during burst
@@ -195,11 +360,11 @@ func _get_preset_profile() -> Dictionary:
             }
         _:  # Default/Low intensity - minimal threat
             return {
-                "spawn_limit": 18,        # Max 18 active enemies at once
-                "spawn_pool": 32,        # Total of 32 enemies available to spawn
-                "initial_population": 8, # Start with 8 enemies
-                "spawn_min": 10.0,        # Spawn intervals: 10-45 seconds
-                "spawn_max": 45.0
+                "spawn_limit": 12,        # Max 18 active enemies at once
+                "spawn_pool": 36,        # Total of 32 enemies available to spawn
+                "initial_population": 4, # Start with 8 enemies
+                "spawn_min": 8.0,        # Spawn intervals: 10-45 seconds
+                "spawn_max": 48.0
             }
 
 func _get_rate_scale() -> float:
@@ -261,48 +426,49 @@ func _build_faction_pool() -> Array:
     var has_custom_modes = EnemyAISettings.bandit_spawn_mode != 0 || EnemyAISettings.guard_spawn_mode != 0 || EnemyAISettings.military_spawn_mode != 0
 
     if has_custom_modes:
-        # Use the original mode-based logic for custom configurations
+        # Respect mode toggles while preserving weighted random selection.
         var default_scene = _get_default_agent_scene()
-        _append_faction_by_mode(pool, default_scene, bandit, EnemyAISettings.bandit_spawn_mode)
-        _append_faction_by_mode(pool, default_scene, guard, EnemyAISettings.guard_spawn_mode)
-        _append_faction_by_mode(pool, default_scene, military, EnemyAISettings.military_spawn_mode)
+        _append_faction_by_mode(pool, default_scene, bandit, EnemyAISettings.bandit_spawn_mode, 10)
+        _append_faction_by_mode(pool, default_scene, guard, EnemyAISettings.guard_spawn_mode, 3)
+        _append_faction_by_mode(pool, default_scene, military, EnemyAISettings.military_spawn_mode, 1)
+        return pool
     else:
-        # Use 10:2:1 ratio (bandit:guard:military) for default behavior
+        # Use 10:3:1 ratio (bandit:guard:military) for default behavior
         # Add bandits (10 parts)
         for i in range(10):
             pool.append(bandit)
-        # Add guards (2 parts)
-        for i in range(2):
+        # Add guards (3 parts)
+        for i in range(3):
             pool.append(guard)
         # Add military (1 part)
         pool.append(military)
 
-    return _dedupe_faction_pool(pool)
+    # Keep weighted entries to preserve ratio-based random selection.
+    return pool
 
 func _has_forced_faction_modes() -> bool:
     return EnemyAISettings.bandit_spawn_mode != 0 || EnemyAISettings.guard_spawn_mode != 0 || EnemyAISettings.military_spawn_mode != 0
 
-func _append_faction_by_mode(pool: Array, default_scene, scene_resource, mode_value: int):
+func _append_faction_by_mode(pool: Array, default_scene, scene_resource, mode_value: int, weight: int):
     var mode = int(mode_value)
+    var should_include = false
 
     if mode == 2:
         return
 
-    if mode == 1:
-        pool.append(scene_resource)
+    if mode == 0:
+        should_include = true
+    elif mode == 1:
+        should_include = true
+    elif scene_resource == default_scene:
+        should_include = true
+
+    if !should_include:
         return
 
-    if scene_resource == default_scene:
+    var safe_weight = max(1, weight)
+    for i in range(safe_weight):
         pool.append(scene_resource)
-
-func _dedupe_faction_pool(pool: Array) -> Array:
-    var unique_pool: Array = []
-
-    for scene_resource in pool:
-        if !unique_pool.has(scene_resource):
-            unique_pool.append(scene_resource)
-
-    return unique_pool
 
 func _describe_faction_pool() -> String:
     var names: Array[String] = []
@@ -370,17 +536,28 @@ func CreatePools():
 
 func _spawn_initial_population(count: int) -> void:
     DebugUtils._debug_log("Starting initial population spawning (async) for %d agents" % count)
-    for attempt in count:
+    var target_spawn_count = min(count, max(0, spawnLimit - activeAgents))
+    var spawned_during_initial = 0
+
+    while spawned_during_initial < target_spawn_count:
         if activeAgents >= spawnLimit:
             DebugUtils._debug_log("Spawn limit reached, stopping initial population spawning")
             break
+
+        initial_spawn_remaining = target_spawn_count - spawned_during_initial
         var before = activeAgents
         SpawnWanderer()
-        if activeAgents <= before:
+        var spawned_this_attempt = activeAgents - before
+        if spawned_this_attempt <= 0:
             DebugUtils._debug_log("No agents spawned this attempt, stopping initial population")
             break
+
+        spawned_during_initial += spawned_this_attempt
+
         # Small delay to avoid overlapping activation and give physics time to settle
         await get_tree().create_timer(0.05, false).timeout
+
+    initial_spawn_remaining = -1
     DebugUtils._debug_log("Initial population spawning complete. Active agents: %d" % activeAgents)
 
 ## Spawns a wandering enemy or team
@@ -391,7 +568,7 @@ func SpawnWanderer():
     if EnemyAISettings.enable_team_spawning:
         _spawn_team_wanderer()  # Spawn entire team at once
     else:
-        super()  # Use base class individual spawning
+        _spawn_single_wanderer()
 
     _handle_spawn_result("Wanderer", before_active)
 
@@ -462,9 +639,13 @@ func _handle_spawn_result(spawn_type: String, before_active: int):
             if last_spawned_agent and last_spawned_agent.has_meta("enemy_ai_faction"):
                 spawned_faction = str(last_spawned_agent.get_meta("enemy_ai_faction"))
                 team_id = last_spawned_agent.get_meta("team_id") if last_spawned_agent.has_meta("team_id") else -1
+            elif last_spawned_agent:
+                DebugUtils._debug_log("WARNING: Team spawn leader without faction metadata!")
 
             DebugUtils._debug_log("Team spawned successfully: %d %s members (team %d). spawned_this_map=%d active=%d" % [spawned_count, spawned_faction, team_id, spawnedThisMap, activeAgents])
-            _debug_record_spawn("Team spawned (%d %s)" % [spawned_count, spawned_faction], spawn_type, spawned_faction)
+            DebugUtils._debug_log("Alive AIs: %d" % activeAgents)
+            _log_faction_breakdown()
+            _debug_record_spawn("Team spawned (%d %s)" % [spawned_count, spawned_faction], spawn_type, spawned_faction, spawned_count)
 
             # Perform spawn validation checks and print unit info for all team members
             for i in range(agents.get_child_count() - spawned_count, agents.get_child_count()):
@@ -478,8 +659,12 @@ func _handle_spawn_result(spawn_type: String, before_active: int):
             var spawned_faction = "Unknown"
             if spawned_agent and spawned_agent.has_meta("enemy_ai_faction"):
                 spawned_faction = str(spawned_agent.get_meta("enemy_ai_faction"))
+            elif spawned_agent:
+                DebugUtils._debug_log("WARNING: %s spawned without faction metadata!" % spawn_type)
             DebugUtils._debug_log("%s spawned successfully as %s. spawned_this_map=%d active=%d" % [spawn_type, spawned_faction, spawnedThisMap, activeAgents])
-            _debug_record_spawn("%s spawned (%s)" % [spawn_type, spawned_faction], spawn_type, spawned_faction)
+            DebugUtils._debug_log("Alive AIs: %d" % activeAgents)
+            _log_faction_breakdown()
+            _debug_record_spawn("%s spawned (%s)" % [spawn_type, spawned_faction], spawn_type, spawned_faction, spawned_count)
             _debug_print_unit_info(spawned_agent, spawn_type)
             _audit_spawned_agent(spawned_agent, spawn_type, "spawn")
             _schedule_spawn_audit(spawned_agent, spawn_type)
@@ -491,6 +676,8 @@ func _handle_spawn_result(spawn_type: String, before_active: int):
 ## Called automatically when agents are defeated to maintain population
 ## Also checks for defeated teams to release occupied spawn points
 func replenish_regular_pool(faction_name: String):
+    DebugUtils._debug_log("Alive AIs: %d" % activeAgents)
+    _log_faction_breakdown()
     if !EnemyAISettings.replenish_spawn_pool:
         return
 
@@ -541,7 +728,7 @@ func _debug_begin_map(event_text: String):
             "last_event": event_text
         })
 
-func _debug_record_spawn(event_text: String, role_name: String, faction_name: String):
+func _debug_record_spawn(event_text: String, role_name: String, faction_name: String, spawn_count: int = 1):
     var debug_main = _debug_main()
     if debug_main:
         debug_main.record_spawn(event_text, activeAgents, {
@@ -552,7 +739,8 @@ func _debug_record_spawn(event_text: String, role_name: String, faction_name: St
             "rate_name": _rate_name(),
             "current_faction": currentFactionName,
             "spawn_faction": faction_name,
-            "spawn_role": role_name
+            "spawn_role": role_name,
+            "spawn_count": max(1, spawn_count)
         })
 
 func _debug_push_status(event_text: String):
@@ -609,18 +797,20 @@ func _audit_spawned_agent(spawned_agent, spawn_type: String, phase: String):
     var reason = str(audit.get("reason", "unknown"))
     var floor_y = float(audit.get("floor_y", spawned_agent.global_position.y))
     var delta_y = float(audit.get("delta_y", 0.0))
+    var collider_name = str(audit.get("collider_name", "none"))
     var source_name = "Unknown"
     if spawned_agent.get("currentPoint") is Node3D:
         source_name = spawned_agent.currentPoint.name
 
-    var event_text = "Suspicious %s spawn (%s): %s dy=%.2f floor=%.2f agent=%.2f point=%s" % [
+    var event_text = "Suspicious %s spawn (%s): %s dy=%.2f floor=%.2f agent=%.2f point=%s collider=%s" % [
         spawn_type,
         phase,
         reason,
         delta_y,
         floor_y,
         spawned_agent.global_position.y,
-        source_name
+        source_name,
+        collider_name
     ]
     DebugUtils._debug_log(event_text)
 
@@ -637,41 +827,33 @@ func _audit_spawned_agent(spawned_agent, spawn_type: String, phase: String):
         })
 
 func _sample_floor_audit(spawned_agent) -> Dictionary:
-    var origin = spawned_agent.global_position + Vector3(0, SPAWN_AUDIT_RAY_ABOVE, 0)
-    var destination = spawned_agent.global_position + Vector3(0, -SPAWN_AUDIT_RAY_BELOW, 0)
-    var query = PhysicsRayQueryParameters3D.create(origin, destination)
-    query.exclude = [spawned_agent]
+    var exclude_nodes: Array = [spawned_agent]
+    if spawned_agent.get("currentPoint") is Node3D:
+        exclude_nodes.append(spawned_agent.currentPoint)
 
-    var result = get_world_3d().direct_space_state.intersect_ray(query)
-    if result.is_empty():
+    var floor_sample = _sample_floor_at_position(spawned_agent.global_position, exclude_nodes)
+    if !bool(floor_sample.get("valid", false)):
         return {
             "suspicious": true,
-            "reason": "no_floor_hit"
+            "reason": floor_sample.get("reason", "no_floor_hit"),
+            "floor_y": float(floor_sample.get("floor_y", spawned_agent.global_position.y)),
+            "delta_y": float(floor_sample.get("delta_y", 0.0))
         }
 
-    var floor_y = float(result.position.y)
-    var delta_y = floor_y - spawned_agent.global_position.y
-
-    if delta_y > SPAWN_AUDIT_BELOW_FLOOR_THRESHOLD:
+    var overlap = _find_spawn_overlap(spawned_agent.global_position, exclude_nodes)
+    if bool(overlap.get("blocked", false)):
         return {
             "suspicious": true,
-            "reason": "below_floor_surface",
-            "floor_y": floor_y,
-            "delta_y": delta_y
-        }
-
-    if delta_y < -SPAWN_AUDIT_ABOVE_FLOOR_THRESHOLD:
-        return {
-            "suspicious": true,
-            "reason": "floating_above_floor",
-            "floor_y": floor_y,
-            "delta_y": delta_y
+            "reason": overlap.get("reason", "inside_blocking_geometry"),
+            "floor_y": float(floor_sample.get("floor_y", spawned_agent.global_position.y)),
+            "delta_y": float(floor_sample.get("delta_y", 0.0)),
+            "collider_name": str(overlap.get("collider_name", "unknown"))
         }
 
     return {
         "suspicious": false,
-        "floor_y": floor_y,
-        "delta_y": delta_y
+        "floor_y": float(floor_sample.get("floor_y", spawned_agent.global_position.y)),
+        "delta_y": float(floor_sample.get("delta_y", 0.0))
     }
 
 func _zone_name() -> String:
@@ -733,17 +915,22 @@ func _get_team_size_for_faction(faction_name: String) -> int:
 
     match faction_name:
         "Bandit":
-            # Bandits spawn in larger groups (3-8) for ambush tactics
-            return randi_range(EnemyAISettings.bandit_team_size_min, EnemyAISettings.bandit_team_size_max)
+            # Bandits spawn in larger groups (3-8) for ambush tactics.
+            return _roll_team_size(EnemyAISettings.bandit_team_size_min, EnemyAISettings.bandit_team_size_max, 8)
         "Guard":
-            # Guards spawn in disciplined pairs/quads (2-4)
-            return randi_range(EnemyAISettings.guard_team_size_min, EnemyAISettings.guard_team_size_max)
+            # Guards spawn in disciplined pairs/quads (2-4).
+            return _roll_team_size(EnemyAISettings.guard_team_size_min, EnemyAISettings.guard_team_size_max, 4)
         "Military":
-            # Military uses fireteam formations (2-4)
-            return randi_range(EnemyAISettings.military_team_size_min, EnemyAISettings.military_team_size_max)
+            # Military uses smaller fireteam formations (2-3).
+            return _roll_team_size(EnemyAISettings.military_team_size_min, EnemyAISettings.military_team_size_max, 3)
         _:
             # Default to single unit for unknown factions
             return 1
+
+func _roll_team_size(config_min: int, config_max: int, hard_max: int) -> int:
+    var clamped_max = max(1, min(config_max, hard_max))
+    var clamped_min = max(1, min(config_min, clamped_max))
+    return randi_range(clamped_min, clamped_max)
 
 ## Spawns an entire team of enemies at once
 ## Finds an available spawn point, determines faction from pool, and creates a coordinated team
@@ -753,8 +940,11 @@ func _spawn_team_wanderer():
         DebugUtils._debug_log("No agents available in pool for team spawning")
         return
 
+    # Generate unique team ID for tracking and coordination
+    var team_id = _generate_unique_team_id()
+
     # Find a suitable spawn point (ensures teams don't spawn on occupied locations)
-    var spawn_point = _find_available_spawn_point()
+    var spawn_point = _find_available_spawn_point(team_id)
     if spawn_point == null:
         DebugUtils._debug_log("No available spawn point found for team")
         return
@@ -763,42 +953,62 @@ func _spawn_team_wanderer():
     var pool_agent = APool.get_child(randi() % APool.get_child_count())
     var faction_name = pool_agent.get_meta("enemy_ai_faction")
 
-    # Generate unique team ID for tracking and coordination
-    var team_id = _generate_unique_team_id()
-
     # Spawn the entire team at the chosen location
     var spawned_team = _spawn_team_at_location(faction_name, spawn_point, team_id)
 
     if spawned_team.is_empty():
         DebugUtils._debug_log("Team spawning failed (no slots or no agents)")
         # Release occupied spawn point since no agents were spawned
-        if EnemyAISettings.enable_team_spawning and occupied_spawn_points.has(spawn_point):
-            occupied_spawn_points.erase(spawn_point)
-            DebugUtils._debug_log("Released occupied spawn point '%s' due to failed team spawn" % spawn_point.name)
+        if EnemyAISettings.enable_team_spawning and occupied_spawn_points_by_team.has(team_id):
+            occupied_spawn_points_by_team.erase(team_id)
+            DebugUtils._debug_log("Released occupied spawn point '%s' for failed team %d spawn" % [spawn_point.name, team_id])
         return
 
     DebugUtils._debug_log("Team %d spawned with %d %s members at %s (active=%d/%d)" % [team_id, spawned_team.size(), faction_name, str(spawn_point.global_position), activeAgents, spawnLimit])
+
+func _spawn_single_wanderer():
+    if APool.get_child_count() == 0:
+        DebugUtils._debug_log("No agents available in pool for wanderer spawning")
+        return
+
+    var spawn_point = _find_available_spawn_point()
+    if spawn_point == null:
+        DebugUtils._debug_log("No available spawn point found for wanderer")
+        return
+
+    var safe_spawn = _resolve_safe_spawn_position(spawn_point)
+    if !bool(safe_spawn.get("valid", false)):
+        DebugUtils._debug_log("Wanderer spawn failed at point '%s': %s" % [
+            spawn_point.name,
+            str(safe_spawn.get("reason", "no_safe_position_near_spawn_point"))
+        ])
+        return
+
+    var new_agent = APool.get_child(0)
+    APool.remove_child(new_agent)
+    agents.add_child(new_agent, true)
+
+    new_agent.boss = false
+    new_agent.AISpawner = self
+    new_agent.currentPoint = spawn_point
+    new_agent.global_position = safe_spawn.get("position", spawn_point.global_position)
+    new_agent.ActivateWanderer()
+    activeAgents += 1
 
 ## Finds an available spawn point using _get_valid_spawn_points for validation
 ## Returns null if no valid spawn points are available
 ## Uses occupation tracking when team spawning is enabled to prevent overlap
 ## Includes distance, floor, and other validations via _get_valid_spawn_points
-func _find_available_spawn_point() -> Node3D:
+func _find_available_spawn_point(team_id: int = -1) -> Node3D:
     if spawns.is_empty():
         return null
 
     var valid_points = _get_valid_spawn_points()
     
     # If no valid points due to occupation, check for defeated teams and release their points
-    if valid_points.is_empty() and EnemyAISettings.enable_team_spawning and not occupied_spawn_points.is_empty():
+    if valid_points.is_empty() and EnemyAISettings.enable_team_spawning and not occupied_spawn_points_by_team.is_empty():
         DebugUtils._debug_log("All valid spawn points occupied, checking for defeated teams")
         _check_and_release_defeated_team_spawn_points()
-        valid_points = _get_valid_spawn_points()
-    
-    # If still empty, clear occupation tracking as fallback
-    if valid_points.is_empty() and EnemyAISettings.enable_team_spawning and not occupied_spawn_points.is_empty():
-        DebugUtils._debug_log("All valid spawn points still occupied, clearing occupation tracking")
-        occupied_spawn_points.clear()
         valid_points = _get_valid_spawn_points()
     
     if valid_points.is_empty():
@@ -807,9 +1017,13 @@ func _find_available_spawn_point() -> Node3D:
     
     var selected_spawn = valid_points.pick_random()
     
-    if EnemyAISettings.enable_team_spawning:
-        occupied_spawn_points.append(selected_spawn)
-        DebugUtils._debug_log("Selected spawn point '%s' at %s (now occupied)" % [selected_spawn.name, str(selected_spawn.global_position)])
+    if EnemyAISettings.enable_team_spawning and team_id >= 0:
+        occupied_spawn_points_by_team[team_id] = selected_spawn
+        DebugUtils._debug_log("Selected spawn point '%s' at %s (reserved for team %d)" % [
+            selected_spawn.name,
+            str(selected_spawn.global_position),
+            team_id
+        ])
     else:
         DebugUtils._debug_log("Selected spawn point '%s' at %s" % [selected_spawn.name, str(selected_spawn.global_position)])
     
@@ -834,23 +1048,29 @@ func _check_and_release_defeated_team_spawn_points():
         return
 
     # Count currently active teams by scanning all agents
-    var active_teams = {}
+    var active_team_ids = {}
     for agent in agents.get_children():
+        if !is_instance_valid(agent):
+            continue
+        if bool(agent.get("dead")):
+            continue
+        if bool(agent.get("pause")):
+            continue
         if agent.has_meta("team_id"):
             var team_id = agent.get_meta("team_id")
-            if !active_teams.has(team_id):
-                active_teams[team_id] = []
-            active_teams[team_id].append(agent)
+            active_team_ids[team_id] = true
 
-    # Simple spawn point management: release excess occupied points
-    # This allows defeated teams' spawn points to be reused by new teams
-    var expected_occupied = active_teams.size()
-    if occupied_spawn_points.size() > expected_occupied:
-        var to_release = occupied_spawn_points.size() - expected_occupied
-        for i in range(to_release):
-            if occupied_spawn_points.size() > 0:
-                occupied_spawn_points.pop_back()
-        DebugUtils._debug_log("Released %d occupied spawn points (active teams: %d)" % [to_release, expected_occupied])
+    # Release only reservations for teams that are no longer active
+    var reserved_team_ids = occupied_spawn_points_by_team.keys()
+    var released_count = 0
+    for reserved_team_id in reserved_team_ids:
+        if active_team_ids.has(reserved_team_id):
+            continue
+        occupied_spawn_points_by_team.erase(reserved_team_id)
+        released_count += 1
+
+    if released_count > 0:
+        DebugUtils._debug_log("Released %d team spawn reservations (active teams: %d)" % [released_count, active_team_ids.size()])
 
 ## Creates and spawns a complete team at the specified spawn point
 ## Returns array of spawned agent nodes
@@ -863,6 +1083,11 @@ func _spawn_team_at_location(faction_name: String, spawn_point: Node3D, team_id:
         DebugUtils._debug_log("Cannot spawn team: spawn limit reached (active=%d, limit=%d)" % [activeAgents, spawnLimit])
         return []
     team_size = min(team_size, available_slots)
+    if initial_spawn_remaining > 0:
+        team_size = min(team_size, initial_spawn_remaining)
+    if team_size <= 0:
+        DebugUtils._debug_log("Cannot spawn team: initial spawn budget exhausted")
+        return []
     var spawned_agents = []
 
     # Find available agents in pool matching the faction
@@ -874,9 +1099,20 @@ func _spawn_team_at_location(faction_name: String, spawn_point: Node3D, team_id:
     # Take up to team_size agents from the pool
     var agents_to_spawn = available_agents.slice(0, min(team_size, available_agents.size()))
 
+    var placed_positions: Array = []
+
     # Spawn each member of the team
     for i in agents_to_spawn.size():
         var agent = agents_to_spawn[i]
+        var safe_spawn = _resolve_safe_spawn_position(spawn_point, placed_positions)
+        if !bool(safe_spawn.get("valid", false)):
+            DebugUtils._debug_log("Team %d member %d skipped: %s" % [
+                team_id,
+                i,
+                str(safe_spawn.get("reason", "no_safe_position_near_spawn_point"))
+            ])
+            continue
+
         APool.remove_child(agent)
         agents.add_child(agent, true)
 
@@ -892,9 +1128,9 @@ func _spawn_team_at_location(faction_name: String, spawn_point: Node3D, team_id:
         # Set spawn point for navigation (matching base class)
         agent.currentPoint = spawn_point
 
-        # Add slight random offset so team members don't occupy exact same position
-        var offset = Vector3(randf_range(-2.0, 2.0), 0, randf_range(-2.0, 2.0))
-        agent.global_position = spawn_point.global_position + offset
+        # Use validated placement to avoid wall/prop/floor collisions.
+        agent.global_position = safe_spawn.get("position", spawn_point.global_position)
+        placed_positions.append(agent.global_position)
 
         # Activate the agent as a wanderer (matching base class behavior)
         agent.ActivateWanderer()
@@ -913,3 +1149,25 @@ func _spawn_team_at_location(faction_name: String, spawn_point: Node3D, team_id:
         DebugUtils._debug_log("Warning: No agents were spawned for team %d" % team_id)
 
     return spawned_agents
+
+## Logs breakdown of active agents by faction for debugging
+func _log_faction_breakdown():
+    var faction_counts = {"Bandit": 0, "Guard": 0, "Military": 0, "Punisher": 0, "Unknown": 0}
+    for agent in agents.get_children():
+        if not is_instance_valid(agent):
+            continue
+        if bool(agent.get("dead")):
+            continue
+        if bool(agent.get("pause")):
+            continue
+        var faction = "Unknown"
+        if agent.has_meta("enemy_ai_faction"):
+            faction = str(agent.get_meta("enemy_ai_faction"))
+        faction_counts[faction] = faction_counts.get(faction, 0) + 1
+    var total_counted = faction_counts["Bandit"] + faction_counts["Guard"] + faction_counts["Military"] + faction_counts["Punisher"] + faction_counts["Unknown"]
+    DebugUtils._debug_log("Faction breakdown: Bandit=%d Guard=%d Military=%d Punisher=%d Unknown=%d (total active=%d)" % [
+        faction_counts["Bandit"], faction_counts["Guard"], faction_counts["Military"], 
+        faction_counts["Punisher"], faction_counts["Unknown"], activeAgents
+    ])
+    if total_counted != activeAgents:
+        DebugUtils._debug_log("WARNING: Faction total mismatch! Counted=%d, activeAgents=%d" % [total_counted, activeAgents])

@@ -23,14 +23,15 @@ class_name EnemyAISettings
 @export var guard_spawn_mode = 0
 @export var military_spawn_mode = 0
 
-@export var bandit_infighting_enabled = false
-@export var guard_infighting_enabled = false
-@export var military_infighting_enabled = false
+@export var bandit_infighting_enabled = true
+@export var guard_infighting_enabled = true
+@export var military_infighting_enabled = true
 @export var warfare_enabled = true
 @export var player_faction_alignment = 0
 @export var corpse_cleanup_limit = 20
 @export var player_invulnerable = false
-@export var show_debug_overlay = true
+@export var show_debug_overlay = false
+@export var show_debug_logs = false
 @export var replenish_spawn_pool = true
 
 @export var ai_health_multiplier = 1.0
@@ -48,16 +49,16 @@ class_name EnemyAISettings
 # When enabled, enemies spawn in coordinated teams rather than individually
 @export var enable_team_spawning = true
 
-# Bandit teams: 3-10 units (larger groups for bandit ambushes)
-@export_range(3, 10, 1) var bandit_team_size_min = 3
-@export_range(3, 10, 1) var bandit_team_size_max = 10
+# Bandit teams: 3-8 units (larger groups for bandit ambushes)
+@export_range(3, 8, 1) var bandit_team_size_min = 3
+@export_range(3, 8, 1) var bandit_team_size_max = 8
 
-# Guard teams: 2-5 units (smaller, disciplined formations)
-@export_range(2, 5, 1) var guard_team_size_min = 2
-@export_range(2, 5, 1) var guard_team_size_max = 5
+# Guard teams: 2-4 units (smaller, disciplined formations)
+@export_range(2, 4, 1) var guard_team_size_min = 2
+@export_range(2, 4, 1) var guard_team_size_max = 4
 
-# Military teams: 2-5 units (tactical fireteams)
-@export_range(2, 5, 1) var military_team_size_min = 2
-@export_range(2, 5, 1) var military_team_size_max = 5
+# Military teams: 2-3 units (tactical fireteams)
+@export_range(2, 3, 1) var military_team_size_min = 2
+@export_range(2, 3, 1) var military_team_size_max = 3
 
 var mcm_enabled = false
