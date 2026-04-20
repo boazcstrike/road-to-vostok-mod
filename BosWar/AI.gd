@@ -45,6 +45,8 @@ const TARGET_PRIORITY_DISTANCE = 25.0
 const TARGET_SCAN_MAX_DISTANCE = 120.0
 const TARGET_SCAN_MIN_DOT = -0.2
 const AI_GUNSHOT_MEMORY_TIME = 1.25
+const AI_TARGET_VISIBLE_GAIN_CONFIRM_SECONDS = 0.06
+const AI_TARGET_VISIBLE_LOST_GRACE_SECONDS = 0.35
 const TRACE_TARGETING_COOLDOWN = 4.0
 const TRACE_HOSTILITY_COOLDOWN = 6.0
 const TRACE_VERBOSE = false
@@ -80,6 +82,9 @@ var _last_teammate_broadcast = {
 var _last_debug_status_push_time = -9999.0
 var _last_debug_status_event = ""
 var _last_debug_status_target = ""
+var _target_visibility_gain_started_at = -1.0
+var _target_visibility_lost_deadline = -1.0
+var _target_visibility_subject_id = -1
 
 func Activate():
     if boss:
@@ -96,6 +101,8 @@ func Activate():
     broadcastCooldownPlayer = 0.0
     broadcastCooldownAI = 0.0
     lastKnownLocation = Vector3.ZERO
+    _reset_target_visibility_hysteresis()
+    _target_visibility_subject_id = -1
     if !is_connected("tree_exited", Callable(self, "_on_tree_exited_shadow_scoring_cleanup")):
         connect("tree_exited", Callable(self, "_on_tree_exited_shadow_scoring_cleanup"))
 
@@ -1773,8 +1780,36 @@ func _is_valid_teammate_target(target_position: Vector3, target_type: String, ta
 
 func _update_target_visibility():
     if _has_valid_ai_target():
+        var target_id = int(currentAITarget.get_instance_id())
+        if _target_visibility_subject_id != target_id:
+            _target_visibility_subject_id = target_id
+            _reset_target_visibility_hysteresis()
+            currentAITargetVisible = false
+
         currentAITargetDistance = global_position.distance_to(currentAITarget.global_position)
-        currentAITargetVisible = _can_see_ai_target(currentAITarget)
+        var now_seconds = Time.get_ticks_msec() / 1000.0
+        var raw_visible = _can_see_ai_target(currentAITarget)
+        if raw_visible:
+            _target_visibility_lost_deadline = -1.0
+            if currentAITargetVisible:
+                _target_visibility_gain_started_at = -1.0
+            else:
+                if _target_visibility_gain_started_at < 0.0:
+                    _target_visibility_gain_started_at = now_seconds
+                if now_seconds - _target_visibility_gain_started_at >= AI_TARGET_VISIBLE_GAIN_CONFIRM_SECONDS:
+                    currentAITargetVisible = true
+                    _target_visibility_gain_started_at = -1.0
+        else:
+            _target_visibility_gain_started_at = -1.0
+            if currentAITargetVisible:
+                if _target_visibility_lost_deadline < 0.0:
+                    _target_visibility_lost_deadline = now_seconds + AI_TARGET_VISIBLE_LOST_GRACE_SECONDS
+                elif now_seconds >= _target_visibility_lost_deadline:
+                    currentAITargetVisible = false
+                    _target_visibility_lost_deadline = -1.0
+            else:
+                _target_visibility_lost_deadline = -1.0
+
         _set_target_label()
         previousAITargetVisible = currentAITargetVisible
 
@@ -1792,6 +1827,8 @@ func _update_target_visibility():
         else:
             is_close_visual_target = false
     else:
+        _reset_target_visibility_hysteresis()
+        _target_visibility_subject_id = -1
         currentAITargetVisible = false
         currentAITargetDistance = 9999.0
         targetLabel = "None"
@@ -1951,6 +1988,8 @@ func _should_play_player_bullet_audio() -> bool:
     return current_target_type == "player" or _can_target_player()
 
 func _clear_ai_target(push_status: bool = true):
+    _reset_target_visibility_hysteresis()
+    _target_visibility_subject_id = -1
     currentAITarget = null
     currentAITargetVisible = false
     currentAITargetDistance = 9999.0
@@ -1971,6 +2010,10 @@ func _set_target_label():
         targetLabel = "%s %.1fm %s" % [_self_or_target_faction_name(currentAITarget), currentAITargetDistance, _quality_tier_to_string(current_target_quality)]
     else:
         targetLabel = "None"
+
+func _reset_target_visibility_hysteresis():
+    _target_visibility_gain_started_at = -1.0
+    _target_visibility_lost_deadline = -1.0
 
 func _self_or_target_faction_name(target_node: Node3D) -> String:
     if is_instance_valid(target_node) and target_node.has_meta("enemy_ai_faction"):

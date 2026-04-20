@@ -58,3 +58,17 @@
    - AI still acquires nearest visible hostile AI.
    - AI still acquires player when player is the best visible target.
    - Team hostility/warfare behavior unchanged.
+
+## Follow-up Tuning (2026-04-21)
+- Symptom: visible target state can flicker rapidly during LOS jitter, causing frequent visual/state churn while spotted.
+- Change in `BosWar/AI.gd`:
+  - Added target visibility hysteresis:
+    - `AI_TARGET_VISIBLE_GAIN_CONFIRM_SECONDS = 0.06`
+    - `AI_TARGET_VISIBLE_LOST_GRACE_SECONDS = 0.35`
+  - `_update_target_visibility()` now:
+    - Requires brief confirm window before switching from unseen -> seen.
+    - Applies short grace window before switching from seen -> unseen.
+    - Resets hysteresis when target instance changes.
+  - `_clear_ai_target()` and activation path now reset hysteresis runtime state.
+- Expected effect:
+  - Reduces rapid seen/unseen flipping under LOS noise, lowering spotting-time behavior/label churn and perceived stutter.
