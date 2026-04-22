@@ -12,6 +12,7 @@ If any summary conflicts with `agents.md`, follow `agents.md`.
 4. [`agents/04-gdscript-standards.md`](./agents/04-gdscript-standards.md)
 5. [`agents/05-project-structuring.md`](./agents/05-project-structuring.md)
 6. [`agents/06-ai-architecture.md`](./agents/06-ai-architecture.md)
+7. [`agents/07-godot-community-standards.md`](./agents/07-godot-community-standards.md)
 
 ## Maintenance
 - Update these summaries whenever `agents.md` changes.

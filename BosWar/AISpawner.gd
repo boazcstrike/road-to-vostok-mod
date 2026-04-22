@@ -18,6 +18,7 @@ var _active_agents_by_team_cache: Dictionary = {}
 var _active_agents_snapshot_cache: Array = []
 var _active_team_member_counts: Dictionary = {}
 var _spawn_point_static_validity_cache: Dictionary = {}
+var _spawn_candidate_offsets_cache: Array = []
 
 
 # Initial rush mode variables for burst spawning
@@ -77,7 +78,9 @@ func _is_spawn_point_static_valid(spawn_point: Node3D) -> bool:
         return false
     var spawn_id = int(spawn_point.get_instance_id())
     if !_spawn_point_static_validity_cache.has(spawn_id):
-        return _is_spawn_point_valid(spawn_point)
+        var is_valid = _is_spawn_point_valid(spawn_point)
+        _spawn_point_static_validity_cache[spawn_id] = is_valid
+        return is_valid
     return bool(_spawn_point_static_validity_cache.get(spawn_id, false))
 
 func _sample_floor_at_position(base_position: Vector3, exclude_nodes: Array = []) -> Dictionary:
@@ -208,7 +211,9 @@ func _find_spawn_overlap(candidate_position: Vector3, exclude_nodes: Array = [])
     }
 
 func _resolve_safe_spawn_position(spawn_point: Node3D, blocked_positions: Array = []) -> Dictionary:
-    var offsets = _build_spawn_candidate_offsets()
+    if _spawn_candidate_offsets_cache.is_empty():
+        _spawn_candidate_offsets_cache = _build_spawn_candidate_offsets()
+    var offsets = _spawn_candidate_offsets_cache
     var exclude_nodes: Array = [spawn_point]
 
     for offset in offsets:
@@ -240,13 +245,25 @@ func _get_valid_spawn_points() -> Array:
     var valid_points = []
     if _spawn_point_static_validity_cache.is_empty() and !spawns.is_empty():
         _refresh_spawn_point_static_validity_cache()
+    var player_position = gameData.playerPosition
+    var spawn_distance_squared = spawnDistance * spawnDistance
+    var use_squared_distance = spawnDistance >= 0.0
+    var occupied_spawn_points_lookup: Dictionary = {}
+    if EnemyAISettings.enable_team_spawning and !occupied_spawn_points_by_team.is_empty():
+        for occupied_spawn_point in occupied_spawn_points_by_team.values():
+            if !is_instance_valid(occupied_spawn_point):
+                continue
+            occupied_spawn_points_lookup[int(occupied_spawn_point.get_instance_id())] = true
     for spawn_point in spawns:
-        var distance_to_player = spawn_point.global_position.distance_to(gameData.playerPosition)
-        if distance_to_player <= spawnDistance:
+        if use_squared_distance:
+            var to_player = spawn_point.global_position - player_position
+            if to_player.length_squared() <= spawn_distance_squared:
+                continue
+        elif spawn_point.global_position.distance_to(player_position) <= spawnDistance:
             continue
         if not _is_spawn_point_static_valid(spawn_point):
             continue
-        if EnemyAISettings.enable_team_spawning and occupied_spawn_points_by_team.values().has(spawn_point):
+        if !occupied_spawn_points_lookup.is_empty() and occupied_spawn_points_lookup.has(int(spawn_point.get_instance_id())):
             continue
         valid_points.append(spawn_point)
     return valid_points

@@ -42,7 +42,7 @@ For every feature, bugfix, refactor, or investigation:
 - `EnemyAISettings.gd`: presets/multipliers/faction toggles.
 - Use state/observer/strategy patterns where appropriate.
 - Use performance-aware updates (distance/agent-count scaling, hysteresis, pooling).
-- Keep faction behavior configurable (infighting + warfare gating + player targeting priority).
+- Keep faction behavior configurable (team hostility + warfare gating + player targeting priority).
 
 ## Detailed References
 Use these for granular guidance/examples:

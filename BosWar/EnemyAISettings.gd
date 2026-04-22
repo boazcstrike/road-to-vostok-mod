@@ -23,9 +23,6 @@ class_name EnemyAISettings
 @export var guard_spawn_mode = 0
 @export var military_spawn_mode = 0
 
-@export var bandit_infighting_enabled = true
-@export var guard_infighting_enabled = true
-@export var military_infighting_enabled = true
 @export var warfare_enabled = true
 @export var player_faction_alignment = 0
 @export var corpse_cleanup_limit = 20
@@ -43,6 +40,14 @@ class_name EnemyAISettings
 @export var threaded_scoring_top_k = 3
 @export var show_threaded_scoring_stats = false
 @export var replenish_spawn_pool = true
+@export var loot_enabled = true
+@export var max_medical = 1
+@export var max_consumables = 2
+@export var max_magazines = 1
+@export var max_ammo = 10
+@export var loot_rolls = 3
+@export var rare_chance = 0.25
+@export var loot_debug = false
 
 @export var ai_health_multiplier = 1.0
 @export var boss_health_multiplier = 1.0
@@ -51,6 +56,10 @@ class_name EnemyAISettings
 @export var ai_accuracy_multiplier = 1.0
 @export var ai_fire_rate_multiplier = 1.0
 @export var ai_gunshot_alert_duration = 5.0
+@export var ai_tactical_reload_enabled = true
+@export var ai_tactical_reload_chance = 0.35
+@export var ai_tactical_reload_min_ratio = 0.45
+@export var ai_tactical_reload_safe_distance = 22.0
 
 # 0=Passive, 1=Default, 2=Aggressive, 3=Relentless
 @export var ai_tactics_preset = 1

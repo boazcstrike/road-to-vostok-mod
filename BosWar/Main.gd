@@ -50,6 +50,7 @@ func _ready():
     _override_script("res://BosWar/AI.gd")
     _override_script("res://BosWar/AISpawner.gd")
     _override_script("res://BosWar/Character.gd")
+    _override_script("res://BosWar/Interface.gd")
     _override_script("res://BosWar/Loader.gd")
     call_deferred("_schedule_mcm_compatibility_patch")
     _ensure_debug_overlay()

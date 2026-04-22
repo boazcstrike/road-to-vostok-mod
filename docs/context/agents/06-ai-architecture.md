@@ -20,8 +20,8 @@ Wander, Guard, Patrol, Combat, Hide, Cover, Vantage, Hunt, Attack, Shift, Return
 
 ## Faction/targeting model
 - Team-vs-team hostility is primary when both AIs have valid `team_id` and IDs differ.
-- Same-faction behavior is controlled by infighting settings when team metadata is unavailable.
-- Inter-faction warfare is controlled by supported-faction checks when team metadata is unavailable.
+- Team-based hostility is the rule for AI-vs-AI engagement decisions.
+- Inter-faction warfare remains controlled by supported-faction checks.
 - Player target priority and audio-triggered acquisition supported.
 
 ## Validation and debug

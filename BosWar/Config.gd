@@ -6,7 +6,7 @@ const DebugUtils = preload("res://BosWar/DebugUtils.gd")
 
 const FILE_PATH = "user://MCM/BosWar"
 const MOD_ID = "BosWar"
-const MOD_VERSION = "0.1.18"
+const MOD_VERSION = "0.1.19"
 
 func _ready() -> void:
     var config = ConfigFile.new()
@@ -158,40 +158,13 @@ func _ready() -> void:
         ]
     })
 
-    config.set_value("Bool", "bandit_infighting_enabled", {
-        "name" = "Enable Bandit Infighting",
-        "tooltip" = "Allows bandits to treat other bandits as enemies and fight each other.",
-        "default" = true,
-        "value" = true
-        ,
-        "menu_pos" = 7
-    })
-
-    config.set_value("Bool", "guard_infighting_enabled", {
-        "name" = "Enable Guard Infighting",
-        "tooltip" = "Allows guards to treat other guards as enemies and fight each other.",
-        "default" = true,
-        "value" = true
-        ,
-        "menu_pos" = 8
-    })
-
-    config.set_value("Bool", "military_infighting_enabled", {
-        "name" = "Enable Military Infighting",
-        "tooltip" = "Allows military units to treat other military units as enemies and fight each other.",
-        "default" = true,
-        "value" = true
-        ,
-        "menu_pos" = 9
-    })
-
     config.set_value("Bool", "warfare_enabled", {
         "name" = "Enable Bo's War",
         "tooltip" = "Allows Bandits, Guards, and Military to fight hostile factions instead of only focusing on the player.",
         "default" = true,
         "value" = true
         ,
-        "menu_pos" = 10
+        "menu_pos" = 7
     })
 
     config.set_value("Dropdown", "player_faction_alignment", {
@@ -252,6 +225,89 @@ func _ready() -> void:
         "value" = true
         ,
         "menu_pos" = 24
+    })
+
+    config.set_value("Bool", "loot_enabled", {
+        "name" = "Enable Enemy Loot",
+        "tooltip" = "Allows enemies to drop bonus loot based on the loot settings below.",
+        "default" = true,
+        "value" = true
+        ,
+        "menu_pos" = 25
+    })
+
+    config.set_value("Dropdown", "loot_amount", {
+        "name" = "Loot Amount",
+        "tooltip" = "Sets the minimum number of loot rolls for enemy drops.",
+        "default" = 2,
+        "value" = 2,
+        "menu_pos" = 26,
+        "options" = [
+            "1 Roll",
+            "2 Rolls",
+            "3 Rolls",
+            "4 Rolls",
+            "5 Rolls"
+        ]
+    })
+
+    config.set_value("Int", "max_consumables", {
+        "name" = "Max Consumables",
+        "tooltip" = "Maximum consumable loot items per enemy drop.",
+        "default" = 2,
+        "value" = 2,
+        "menu_pos" = 27,
+        "minRange" = 0,
+        "maxRange" = 5
+    })
+
+    config.set_value("Int", "max_medical", {
+        "name" = "Max Medical",
+        "tooltip" = "Maximum medical loot items per enemy drop.",
+        "default" = 1,
+        "value" = 1,
+        "menu_pos" = 27,
+        "minRange" = 0,
+        "maxRange" = 5
+    })
+
+    config.set_value("Int", "max_magazines", {
+        "name" = "Max Magazines",
+        "tooltip" = "Maximum magazine loot items per enemy drop.",
+        "default" = 1,
+        "value" = 1,
+        "menu_pos" = 28,
+        "minRange" = 0,
+        "maxRange" = 3
+    })
+
+    config.set_value("Int", "max_ammo", {
+        "name" = "Max Ammo",
+        "tooltip" = "Maximum ammo loot amount per enemy drop.",
+        "default" = 10,
+        "value" = 10,
+        "menu_pos" = 28,
+        "minRange" = 0,
+        "maxRange" = 50
+    })
+
+    config.set_value("Float", "rare_chance", {
+        "name" = "Rare Loot Chance",
+        "tooltip" = "Chance that a loot roll picks a rare item.",
+        "default" = 0.25,
+        "value" = 0.25,
+        "menu_pos" = 29,
+        "minRange" = 0.0,
+        "maxRange" = 1.0
+    })
+
+    config.set_value("Bool", "loot_debug", {
+        "name" = "Loot Debug Logs",
+        "tooltip" = "Enables debug logs for enemy loot generation.",
+        "default" = false,
+        "value" = false
+        ,
+        "menu_pos" = 29
     })
 
     config.set_value("Float", "ai_health_multiplier", {
@@ -324,6 +380,45 @@ func _ready() -> void:
         "maxRange" = 20.0
     })
 
+    config.set_value("Bool", "ai_tactical_reload_enabled", {
+        "name" = "AI Tactical Reload Enabled",
+        "tooltip" = "Advanced. Lets enemies sometimes top off partial magazines when it is safe.",
+        "default" = true,
+        "value" = true
+        ,
+        "menu_pos" = 38
+    })
+
+    config.set_value("Float", "ai_tactical_reload_chance", {
+        "name" = "AI Tactical Reload Chance",
+        "tooltip" = "Advanced. Chance that an enemy performs a tactical reload when all tactical conditions are met.",
+        "default" = 0.35,
+        "value" = 0.35,
+        "menu_pos" = 39,
+        "minRange" = 0.0,
+        "maxRange" = 1.0
+    })
+
+    config.set_value("Float", "ai_tactical_reload_min_ratio", {
+        "name" = "AI Tactical Reload Min Mag Ratio",
+        "tooltip" = "Advanced. Enemies consider tactical reload only when remaining magazine ratio is at or below this value.",
+        "default" = 0.45,
+        "value" = 0.45,
+        "menu_pos" = 40,
+        "minRange" = 0.05,
+        "maxRange" = 0.95
+    })
+
+    config.set_value("Float", "ai_tactical_reload_safe_distance", {
+        "name" = "AI Tactical Reload Safe Distance",
+        "tooltip" = "Advanced. Minimum engagement distance required before enemies attempt tactical reload.",
+        "default" = 22.0,
+        "value" = 22.0,
+        "menu_pos" = 41,
+        "minRange" = 5.0,
+        "maxRange" = 120.0
+    })
+
     config.set_value("Dropdown", "ai_tactics_preset", {
         "name" = "Enemy Aggression",
         "tooltip" = "Advanced. Controls how aggressively enemies cycle through combat behaviors.",
@@ -380,15 +475,20 @@ func _on_config_updated(config: ConfigFile):
     enemyAISettings.guard_spawn_mode = config.get_value("Dropdown", "guard_spawn_mode")["value"]
     enemyAISettings.military_spawn_mode = config.get_value("Dropdown", "military_spawn_mode")["value"]
     enemyAISettings.warfare_enabled = config.get_value("Bool", "warfare_enabled")["value"]
-    enemyAISettings.bandit_infighting_enabled = config.get_value("Bool", "bandit_infighting_enabled", {"value": true})["value"]
-    enemyAISettings.guard_infighting_enabled = config.get_value("Bool", "guard_infighting_enabled", {"value": true})["value"]
-    enemyAISettings.military_infighting_enabled = config.get_value("Bool", "military_infighting_enabled", {"value": true})["value"]
     enemyAISettings.player_faction_alignment = config.get_value("Dropdown", "player_faction_alignment", {"value": 0})["value"]
     enemyAISettings.corpse_cleanup_limit = config.get_value("Int", "corpse_cleanup_limit", {"value": 20})["value"]
     enemyAISettings.player_invulnerable = config.get_value("Bool", "player_invulnerable", {"value": false})["value"]
     enemyAISettings.show_debug_overlay = config.get_value("Bool", "show_debug_overlay")["value"]
     enemyAISettings.show_debug_logs = config.get_value("Bool", "show_debug_logs", {"value": true})["value"]
     enemyAISettings.replenish_spawn_pool = config.get_value("Bool", "replenish_spawn_pool", {"value": true})["value"]
+    enemyAISettings.loot_enabled = config.get_value("Bool", "loot_enabled", {"value": true})["value"]
+    enemyAISettings.loot_rolls = config.get_value("Dropdown", "loot_amount", {"value": 2})["value"] + 1
+    enemyAISettings.max_consumables = config.get_value("Int", "max_consumables", {"value": 2})["value"]
+    enemyAISettings.max_medical = config.get_value("Int", "max_medical", {"value": 1})["value"]
+    enemyAISettings.max_magazines = config.get_value("Int", "max_magazines", {"value": 1})["value"]
+    enemyAISettings.max_ammo = config.get_value("Int", "max_ammo", {"value": 10})["value"]
+    enemyAISettings.rare_chance = config.get_value("Float", "rare_chance", {"value": 0.25})["value"]
+    enemyAISettings.loot_debug = config.get_value("Bool", "loot_debug", {"value": false})["value"]
     enemyAISettings.ai_health_multiplier = config.get_value("Float", "ai_health_multiplier")["value"]
     enemyAISettings.boss_health_multiplier = config.get_value("Float", "boss_health_multiplier")["value"]
     enemyAISettings.ai_sight_multiplier = config.get_value("Float", "ai_sight_multiplier")["value"]
@@ -396,6 +496,10 @@ func _on_config_updated(config: ConfigFile):
     enemyAISettings.ai_accuracy_multiplier = config.get_value("Float", "ai_accuracy_multiplier")["value"]
     enemyAISettings.ai_fire_rate_multiplier = config.get_value("Float", "ai_fire_rate_multiplier")["value"]
     enemyAISettings.ai_gunshot_alert_duration = config.get_value("Float", "ai_gunshot_alert_duration")["value"]
+    enemyAISettings.ai_tactical_reload_enabled = config.get_value("Bool", "ai_tactical_reload_enabled", {"value": true})["value"]
+    enemyAISettings.ai_tactical_reload_chance = config.get_value("Float", "ai_tactical_reload_chance", {"value": 0.35})["value"]
+    enemyAISettings.ai_tactical_reload_min_ratio = config.get_value("Float", "ai_tactical_reload_min_ratio", {"value": 0.45})["value"]
+    enemyAISettings.ai_tactical_reload_safe_distance = config.get_value("Float", "ai_tactical_reload_safe_distance", {"value": 22.0})["value"]
     enemyAISettings.ai_tactics_preset = config.get_value("Dropdown", "ai_tactics_preset")["value"]
     enemyAISettings.mcm_enabled = true
 
@@ -451,7 +555,16 @@ func _sync_config_metadata(config: ConfigFile) -> bool:
         "Relentless"
     ]) or changed
 
+    changed = _sync_dropdown_options(config, "loot_amount", [
+        "1 Roll",
+        "2 Rolls",
+        "3 Rolls",
+        "4 Rolls",
+        "5 Rolls"
+    ]) or changed
+
     changed = _sync_dropdown_default(config, "intensity_preset", 0) or changed
+    changed = _sync_dropdown_default(config, "loot_amount", 2) or changed
 
     return changed
 

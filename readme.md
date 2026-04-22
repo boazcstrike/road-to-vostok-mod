@@ -4,11 +4,11 @@
 [![Version](https://img.shields.io/badge/Version-0.0.1-orange.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-An advanced enemy AI enhancement mod for the game *Road to Vostok*, introducing sophisticated AI behaviors, faction-based warfare, and configurable difficulty systems.
+An advanced enemy AI enhancement mod for the game *Road to Vostok*, introducing sophisticated AI behaviors, team-based warfare, and configurable difficulty systems.
 
 ## 🎯 Overview
 
-Bo's War transforms the enemy AI in Road to Vostok from basic scripted behaviors into intelligent, adaptive opponents that provide challenging and immersive gameplay experiences. The mod introduces faction-based targeting, audio sensing, tactical waypoint navigation, and configurable difficulty presets.
+Bo's War transforms the enemy AI in Road to Vostok from basic scripted behaviors into intelligent, adaptive opponents that provide challenging and immersive gameplay experiences. The mod introduces team-based targeting, audio sensing, tactical waypoint navigation, and configurable difficulty presets.
 
 ## Quick Guide
 
@@ -21,7 +21,7 @@ Bo's War transforms the enemy AI in Road to Vostok from basic scripted behaviors
 ## ✨ Key Features
 
 ### 🤖 Advanced AI Behaviors
-- **Faction-Based Targeting**: Enemies distinguish between player, allies, and rival factions
+- **Team-Based Targeting**: Enemies distinguish between player, allies, and rival teams
 - **Audio Sensing**: AI can detect gunfire and movement sounds from a distance
 - **Tactical Navigation**: Intelligent use of cover points, waypoints, and hiding spots
 - **State Machine**: Dynamic behavior states (Wander, Combat, Hide, Patrol, etc.)
@@ -35,7 +35,7 @@ Bo's War transforms the enemy AI in Road to Vostok from basic scripted behaviors
 
 ### 🏰 Faction Warfare System
 - **Inter-Faction Combat**: Configurable warfare between different enemy factions
-- **Infighting**: Optional same-faction combat for dynamic encounters
+- **Team Hostility**: Different enemy teams are treated as hostile in combat
 - **Player Alignment**: Potential for player to ally with specific factions
 
 ### 🔧 Configuration & Modding
@@ -97,8 +97,7 @@ The mod can be configured through the in-game Mod Configuration Menu (MCM) or by
 - **AI Difficulty**: Choose from Passive, Default, Aggressive, or Relentless
 - **Sight Multiplier**: Adjust AI vision range (0.1x to 5.0x)
 - **Accuracy Multiplier**: Control AI shooting accuracy
-- **Faction Warfare**: Enable/disable inter-faction combat
-- **Infighting**: Allow same-faction combat
+- **Team Warfare**: Enable/disable inter-team combat
 
 ### Advanced Configuration
 For advanced users, modify the settings in `EnemyAISettings.gd`:
@@ -107,7 +106,6 @@ For advanced users, modify the settings in `EnemyAISettings.gd`:
 @export var ai_health_multiplier: float = 1.0
 @export var ai_sight_multiplier: float = 1.0
 @export_range(0.1, 5.0, 0.1) var ai_accuracy_multiplier: float = 1.0
-@export var bandit_infighting_enabled: bool = false
 @export var enable_faction_warfare: bool = true
 ```
 
@@ -116,7 +114,7 @@ For advanced users, modify the settings in `EnemyAISettings.gd`:
 ### In-Game Features
 - **Enhanced Enemy Behavior**: AI now uses cover, flanks, and tactical positioning
 - **Audio Awareness**: Enemies react to distant gunfire and investigate sounds
-- **Faction Dynamics**: Different enemy groups may fight each other
+- **Faction Dynamics**: Different enemy teams may fight each other
 - **Scalable Difficulty**: Adjust AI challenge without restarting
 
 ### Debug Mode
@@ -202,3 +200,16 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **Made with ❤️ for the Road to Vostok community**
+## Third-Party Reference
+- ImmersiveXP merge-prep research in this repository references **Oldman's Immersive Overhaul** from ModWorkshop.
+- Source: https://modworkshop.net/mod/50811
+- This reference is for analysis/planning attribution while preparing BosWar integration work.
+- This BosWar mod is also heavily influenced by the following ModWorkshop mods:
+
+### Faction Warfare + More Enemies (ModWorkshop #56026)
+This mod expands Road to Vostok combat by enabling active hostility between Bandits, Guards, and Military, while also increasing enemy activity through configurable density presets, reinforcement pacing, and faction spawn controls. It frames faction warfare as a core gameplay loop rather than a player-only threat model, and exposes practical MCM tuning for allegiance, AI behavior, and battlefield cleanup, which aligns closely with BosWar's configurable multi-faction combat direction.
+Source: https://modworkshop.net/mod/56026
+
+### Better Enemy Loot (ModWorkshop #56230)
+This mod focuses on post-kill reward consistency by giving enemies a small, believable personal loot pool on death, weighted to stay modest while still improving encounter payoff. Its description emphasizes lore-friendly item distribution by faction/context and configurable drop behavior, which parallels BosWar's design goal of making AI encounters feel more systemic and grounded instead of script-empty.
+Source: https://modworkshop.net/mod/56230

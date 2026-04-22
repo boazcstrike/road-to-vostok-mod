@@ -62,8 +62,13 @@ const TEAMMATE_DUPLICATE_POSITION_EPSILON_SQ = 2.25
 const TEAMMATE_INTAKE_PROCESS_BUDGET = 3
 const TEAMMATE_INTAKE_QUEUE_MAX = 24
 const TARGETED_HITBOX_BURST_RESET_SECONDS = 0.35
-const TEAMMATE_PLAYER_SUPPRESSIVE_FIRE_MIN_SECONDS = 15.0
-const TEAMMATE_PLAYER_SUPPRESSIVE_FIRE_MAX_SECONDS = 60.0
+const SUPPRESSIVE_FIRE_MAGAZINES = 2
+const SUPPRESSIVE_FIRE_MIN_LKL_DISTANCE = 4.0
+const AI_RELOAD_SECONDS = 2.2
+const AI_HIDDEN_SUPPRESSIVE_SPRAY_CHANCE = 0.30
+const AI_SUPERSONIC_CRACK_MAX_FLYBY_DISTANCE = 2.4
+const AI_SUPERSONIC_CRACK_SOUND_SPEED = 343.0
+const AI_SUPERSONIC_CRACK_MAX_DELAY = 0.45
 var current_target_type = "none"  # "player", "ai", or "none"
 var current_target_score = 0.0
 var current_target_quality = QualityTier.SECOND_HAND
@@ -103,8 +108,16 @@ var _target_visibility_has_last_raw_sample = false
 var _target_scan_cursor = 0
 var _pending_teammate_target_queue = []
 var _last_shot_timestamp_seconds = -9999.0
-var _teammate_player_suppressive_fire_until = -1.0
-var _teammate_player_suppressive_target_position = Vector3.ZERO
+var _suppressive_fire_active = false
+var _suppressive_fire_target_type = "none"
+var _suppressive_fire_target_position = Vector3.ZERO
+var _suppressive_fire_rounds_remaining = 0
+var _previous_player_visible = false
+var _magazine_capacity = 1
+var _magazine_rounds = 1
+var _is_reloading = false
+var _reload_end_time_seconds = -1.0
+static var _loot_pool_profile_cache = {}
 
 func Activate():
     if boss:
@@ -127,6 +140,7 @@ func Activate():
         connect("tree_exited", Callable(self, "_on_tree_exited_shadow_scoring_cleanup"))
 
     super()
+    _initialize_ammo_state()
 
 func Parameters(delta):
     super(delta)
@@ -215,6 +229,7 @@ func FireDetection(delta):
         if fireVector > 0.95:
             _last_known_location_data = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.AUDIO}
             lastKnownLocation = playerPosition
+            _arm_suppressive_fire("player", playerPosition)
             _broadcast_target_to_teammates(playerPosition, "audio_player_gunshot", null, QualityTier.AUDIO)
 
             fireDetected = true
@@ -223,6 +238,7 @@ func FireDetection(delta):
             if currentState != State.Ambush:
                 _last_known_location_data = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.AUDIO}
                 lastKnownLocation = playerPosition
+                _arm_suppressive_fire("player", playerPosition)
                 _broadcast_target_to_teammates(playerPosition, "audio_player_gunshot", null, QualityTier.AUDIO)
 
             fireDetected = true
@@ -237,6 +253,11 @@ func FireDetection(delta):
             fireDetected = false
 
 func Decision():
+    var now_seconds = Time.get_ticks_msec() / 1000.0
+    _update_reload_state(now_seconds)
+    _ensure_reload_if_empty(now_seconds)
+    var ammo_ready_for_aggressive_actions = _has_ammo_ready_for_aggressive_decision()
+
     if is_close_visual_target:
         ChangeState("Combat")
         return
@@ -261,11 +282,11 @@ func Decision():
             ChangeState("Vantage")
         elif decision == 5:
             ChangeState("Defend")
-        elif decision == 6 and engagement_visible and engagement_distance < 100 and can_direct_attack:
+        elif decision == 6 and ammo_ready_for_aggressive_actions and engagement_visible and engagement_distance < 100 and can_direct_attack:
             ChangeState("Hunt")
-        elif decision == 7 and engagement_visible and engagement_distance < 100 and can_direct_attack:
+        elif decision == 7 and ammo_ready_for_aggressive_actions and engagement_visible and engagement_distance < 100 and can_direct_attack:
             ChangeState("Shift")
-        elif decision == 8 and engagement_visible and engagement_distance < 100 and can_direct_attack and (weaponData.weaponAction != "Manual"):
+        elif decision == 8 and ammo_ready_for_aggressive_actions and engagement_visible and engagement_distance < 100 and can_direct_attack and (weaponData.weaponAction != "Manual"):
             ChangeState("Attack")
         else:
             ChangeState("Combat")
@@ -276,9 +297,9 @@ func Decision():
             ChangeState("Combat")
         elif decision_close == 2:
             ChangeState("Defend")
-        elif decision_close == 3 and engagement_visible and can_direct_attack:
+        elif decision_close == 3 and ammo_ready_for_aggressive_actions and engagement_visible and can_direct_attack:
             ChangeState("Hunt")
-        elif decision_close == 4 and engagement_visible and can_direct_attack and (weaponData.weaponAction != "Manual"):
+        elif decision_close == 4 and ammo_ready_for_aggressive_actions and engagement_visible and can_direct_attack and (weaponData.weaponAction != "Manual"):
             ChangeState("Attack")
         else:
             ChangeState("Combat")
@@ -332,10 +353,11 @@ func Attack(delta):
             ChangeState("Combat")
 
 func Return():
-    if global_transform.origin.distance_to(agent.target_position) < 2.0:
+    var distance_to_target_sq = global_transform.origin.distance_squared_to(agent.target_position)
+    if distance_to_target_sq < 4.0:
         speed = 1.0
         turnSpeed = 2.0
-    elif global_transform.origin.distance_to(agent.target_position) < 4.0:
+    elif distance_to_target_sq < 16.0:
         speed = 3.0
         turnSpeed = 5.0
 
@@ -364,23 +386,44 @@ func Fire(delta):
     if impact or _player_only_combat_blocked():
         return
 
-    var suppressive_player_fire = _should_force_suppressive_player_fire()
-    if !suppressive_player_fire and (!_is_last_known_location_valid() or _last_known_location_data.position.distance_to(_get_engagement_position()) > 4.0):
+    var suppressive_fire_active = _is_suppressive_fire_active()
+    if !suppressive_fire_active and (!_is_last_known_location_valid() or _last_known_location_data.position.distance_to(_get_engagement_position()) > SUPPRESSIVE_FIRE_MIN_LKL_DISTANCE):
+        return
+
+    var now_seconds = Time.get_ticks_msec() / 1000.0
+    _update_reload_state(now_seconds)
+    if _should_start_tactical_reload(suppressive_fire_active):
+        _start_reload(now_seconds)
+        return
+    if !_can_fire_with_ammo(now_seconds):
         return
 
     if weaponData.weaponAction == "Semi-Auto":
         Selector(delta)
-    if suppressive_player_fire:
+    if suppressive_fire_active:
         fullAuto = true
 
     fireTime -= delta
 
     if fireTime <= 0:
-        var now_seconds = Time.get_ticks_msec() / 1000.0
+        if suppressive_fire_active and current_target_type == "ai" and randf() > AI_HIDDEN_SUPPRESSIVE_SPRAY_CHANCE:
+            FireFrequency()
+            return
+
+        _consume_round(now_seconds)
+        if suppressive_fire_active:
+            _consume_suppressive_round()
         var is_first_shot_in_burst = now_seconds - _last_shot_timestamp_seconds > TARGETED_HITBOX_BURST_RESET_SECONDS
         _last_shot_timestamp_seconds = now_seconds
         _mark_ai_gunshot()
-        Raycast(is_first_shot_in_burst)
+        var shot_target_position = FireAccuracy()
+        var should_play_supersonic_crack = _should_play_supersonic_crack_flyby(shot_target_position)
+        Raycast(is_first_shot_in_burst, shot_target_position)
+        if should_play_supersonic_crack:
+            PlayCrack()
+            var crack_shot_delay = _supersonic_crack_shot_delay_seconds()
+            if crack_shot_delay > 0.0:
+                await get_tree().create_timer(crack_shot_delay, false).timeout
         PlayFire()
         PlayTail()
         MuzzleVFX()
@@ -408,10 +451,6 @@ func Fire(delta):
         flash.Activate()
 
         FireFrequency()
-
-        if _should_play_player_bullet_audio() and _get_engagement_distance() > 50:
-            await get_tree().create_timer(0.1, false).timeout
-            PlayCrack()
 
 func FireFrequency():
     var engagement_distance = _get_engagement_distance()
@@ -441,6 +480,126 @@ func FireFrequency():
         fireTime = randf_range(1.0, 4.0)
 
     fireTime = max(0.05, fireTime / max(0.1, EnemyAISettings.ai_fire_rate_multiplier))
+
+func _initialize_ammo_state():
+    _magazine_capacity = 1
+    if weaponData:
+        _magazine_capacity = max(1, int(weaponData.magazineSize))
+
+    _magazine_rounds = _magazine_capacity
+    if is_instance_valid(weapon) and weapon.slotData:
+        var slot_rounds = int(weapon.slotData.amount)
+        if slot_rounds > 0:
+            _magazine_rounds = int(clamp(slot_rounds, 1, _magazine_capacity))
+        weapon.slotData.amount = _magazine_rounds
+
+    _is_reloading = false
+    _reload_end_time_seconds = -1.0
+    _clear_suppressive_fire()
+    _previous_player_visible = false
+
+func _start_reload(now_seconds: float):
+    if _is_reloading:
+        return
+    _is_reloading = true
+    _reload_end_time_seconds = now_seconds + AI_RELOAD_SECONDS
+
+func _update_reload_state(now_seconds: float):
+    if !_is_reloading:
+        return
+    if now_seconds < _reload_end_time_seconds:
+        return
+
+    _is_reloading = false
+    _reload_end_time_seconds = -1.0
+    _magazine_rounds = _magazine_capacity
+    if is_instance_valid(weapon) and weapon.slotData:
+        weapon.slotData.amount = _magazine_rounds
+
+func _can_fire_with_ammo(now_seconds: float) -> bool:
+    if _is_reloading:
+        return false
+    if _magazine_rounds > 0:
+        return true
+
+    _start_reload(now_seconds)
+    return false
+
+func _consume_round(now_seconds: float):
+    if _magazine_rounds <= 0:
+        _start_reload(now_seconds)
+        return
+
+    _magazine_rounds -= 1
+    if is_instance_valid(weapon) and weapon.slotData:
+        weapon.slotData.amount = max(0, _magazine_rounds)
+    if _magazine_rounds <= 0:
+        _start_reload(now_seconds)
+
+func _ensure_reload_if_empty(now_seconds: float):
+    if _magazine_rounds <= 0 and !_is_reloading:
+        _start_reload(now_seconds)
+
+func _has_ammo_ready_for_aggressive_decision() -> bool:
+    if _is_reloading:
+        return false
+    return _magazine_rounds > 0
+
+func _should_start_tactical_reload(suppressive_fire_active: bool) -> bool:
+    if !_tactical_reload_enabled():
+        return false
+    if _is_reloading:
+        return false
+    if suppressive_fire_active:
+        return false
+    if _engagement_visible():
+        return false
+    if _magazine_capacity <= 1:
+        return false
+    if _magazine_rounds <= 0 or _magazine_rounds >= _magazine_capacity:
+        return false
+
+    var engagement_distance = _get_engagement_distance()
+    if engagement_distance < _tactical_reload_safe_distance():
+        return false
+
+    var ammo_ratio = float(_magazine_rounds) / float(max(1, _magazine_capacity))
+    if ammo_ratio > _tactical_reload_min_ratio():
+        return false
+
+    return randf() <= _tactical_reload_chance()
+
+func _tactical_reload_enabled() -> bool:
+    if EnemyAISettings == null:
+        return true
+    var setting_value = EnemyAISettings.get("ai_tactical_reload_enabled")
+    if setting_value == null:
+        return true
+    return bool(setting_value)
+
+func _tactical_reload_chance() -> float:
+    if EnemyAISettings == null:
+        return 0.35
+    var setting_value = EnemyAISettings.get("ai_tactical_reload_chance")
+    if setting_value == null:
+        return 0.35
+    return clamp(float(setting_value), 0.0, 1.0)
+
+func _tactical_reload_min_ratio() -> float:
+    if EnemyAISettings == null:
+        return 0.45
+    var setting_value = EnemyAISettings.get("ai_tactical_reload_min_ratio")
+    if setting_value == null:
+        return 0.45
+    return clamp(float(setting_value), 0.05, 0.95)
+
+func _tactical_reload_safe_distance() -> float:
+    if EnemyAISettings == null:
+        return 22.0
+    var setting_value = EnemyAISettings.get("ai_tactical_reload_safe_distance")
+    if setting_value == null:
+        return 22.0
+    return max(5.0, float(setting_value))
 
 func FireAccuracy() -> Vector3:
     var fireDirection = _get_fire_target_position()
@@ -495,8 +654,11 @@ func _should_use_targeted_hitbox_damage(is_first_shot_in_burst: bool) -> bool:
         return true
     return _get_engagement_distance() <= TARGET_PRIORITY_DISTANCE
 
-func Raycast(is_first_shot_in_burst: bool = false):
-    fire.look_at(FireAccuracy(), Vector3.UP, true)
+func Raycast(is_first_shot_in_burst: bool = false, shot_target_position: Vector3 = Vector3.ZERO):
+    var target_position = shot_target_position
+    if target_position == Vector3.ZERO:
+        target_position = FireAccuracy()
+    fire.look_at(target_position, Vector3.UP, true)
     fire.force_raycast_update()
 
     if fire.is_colliding():
@@ -533,14 +695,15 @@ func Raycast(is_first_shot_in_burst: bool = false):
 func GetHidePoint() -> bool:
     var validPoints: Array[Node3D]
     var engagement_position = _get_engagement_position()
+    var max_distance_sq = 40.0 * 40.0
 
     if nearbyPoints.size() != 0:
         for point in nearbyPoints:
             if point.is_in_group("AI_HP"):
-                var distanceToAI = global_position.distance_to(point.global_position)
-                var distanceToTarget = point.global_position.distance_to(engagement_position)
+                var distance_to_ai_sq = global_position.distance_squared_to(point.global_position)
+                var distance_to_target_sq = point.global_position.distance_squared_to(engagement_position)
 
-                if distanceToAI < 40 and distanceToAI < distanceToTarget:
+                if distance_to_ai_sq < max_distance_sq and distance_to_ai_sq < distance_to_target_sq:
                     if point != currentPoint:
                         validPoints.append(point)
 
@@ -554,15 +717,16 @@ func GetHidePoint() -> bool:
 
 func _has_hide_point_candidate() -> bool:
     var engagement_position = _get_engagement_position()
+    var max_distance_sq = 40.0 * 40.0
 
     if nearbyPoints.size() == 0:
         return false
 
     for point in nearbyPoints:
         if point.is_in_group("AI_HP"):
-            var distanceToAI = global_position.distance_to(point.global_position)
-            var distanceToTarget = point.global_position.distance_to(engagement_position)
-            if distanceToAI < 40 and distanceToAI < distanceToTarget and point != currentPoint:
+            var distance_to_ai_sq = global_position.distance_squared_to(point.global_position)
+            var distance_to_target_sq = point.global_position.distance_squared_to(engagement_position)
+            if distance_to_ai_sq < max_distance_sq and distance_to_ai_sq < distance_to_target_sq and point != currentPoint:
                 return true
 
     return false
@@ -570,14 +734,15 @@ func _has_hide_point_candidate() -> bool:
 func GetVantagePoint() -> bool:
     var validPoints: Array[Node3D]
     var engagement_position = _get_engagement_position()
+    var max_distance_sq = 40.0 * 40.0
 
     if nearbyPoints.size() != 0:
         for point in nearbyPoints:
             if point.is_in_group("AI_PP"):
-                var distanceToAI = global_position.distance_to(point.global_position)
-                var distanceToTarget = point.global_position.distance_to(engagement_position)
+                var distance_to_ai_sq = global_position.distance_squared_to(point.global_position)
+                var distance_to_target_sq = point.global_position.distance_squared_to(engagement_position)
 
-                if distanceToAI < 40 and distanceToAI < distanceToTarget:
+                if distance_to_ai_sq < max_distance_sq and distance_to_ai_sq < distance_to_target_sq:
                     var direction = (engagement_position - point.global_position).normalized()
                     var vector = direction.dot(point.global_transform.basis.z)
 
@@ -594,15 +759,16 @@ func GetVantagePoint() -> bool:
 
 func _has_vantage_point_candidate() -> bool:
     var engagement_position = _get_engagement_position()
+    var max_distance_sq = 40.0 * 40.0
 
     if nearbyPoints.size() == 0:
         return false
 
     for point in nearbyPoints:
         if point.is_in_group("AI_PP"):
-            var distanceToAI = global_position.distance_to(point.global_position)
-            var distanceToTarget = point.global_position.distance_to(engagement_position)
-            if distanceToAI < 40 and distanceToAI < distanceToTarget:
+            var distance_to_ai_sq = global_position.distance_squared_to(point.global_position)
+            var distance_to_target_sq = point.global_position.distance_squared_to(engagement_position)
+            if distance_to_ai_sq < max_distance_sq and distance_to_ai_sq < distance_to_target_sq:
                 var direction = (engagement_position - point.global_position).normalized()
                 var vector = direction.dot(point.global_transform.basis.z)
                 if vector > 0.9 and point != currentPoint:
@@ -613,14 +779,15 @@ func _has_vantage_point_candidate() -> bool:
 func GetCoverPoint() -> bool:
     var validPoints: Array[Node3D]
     var engagement_position = _get_engagement_position()
+    var max_distance_sq = 40.0 * 40.0
 
     if nearbyPoints.size() != 0:
         for point in nearbyPoints:
             if point.is_in_group("AI_CP"):
-                var distanceToAI = global_position.distance_to(point.global_position)
-                var distanceToTarget = point.global_position.distance_to(engagement_position)
+                var distance_to_ai_sq = global_position.distance_squared_to(point.global_position)
+                var distance_to_target_sq = point.global_position.distance_squared_to(engagement_position)
 
-                if distanceToAI < 40 and distanceToAI < distanceToTarget:
+                if distance_to_ai_sq < max_distance_sq and distance_to_ai_sq < distance_to_target_sq:
                     var direction = (engagement_position - point.global_position).normalized()
                     var vector = direction.dot(point.global_transform.basis.z)
 
@@ -637,15 +804,16 @@ func GetCoverPoint() -> bool:
 
 func _has_cover_point_candidate() -> bool:
     var engagement_position = _get_engagement_position()
+    var max_distance_sq = 40.0 * 40.0
 
     if nearbyPoints.size() == 0:
         return false
 
     for point in nearbyPoints:
         if point.is_in_group("AI_CP"):
-            var distanceToAI = global_position.distance_to(point.global_position)
-            var distanceToTarget = point.global_position.distance_to(engagement_position)
-            if distanceToAI < 40 and distanceToAI < distanceToTarget:
+            var distance_to_ai_sq = global_position.distance_squared_to(point.global_position)
+            var distance_to_target_sq = point.global_position.distance_squared_to(engagement_position)
+            if distance_to_ai_sq < max_distance_sq and distance_to_ai_sq < distance_to_target_sq:
                 var direction = (engagement_position - point.global_position).normalized()
                 var vector = direction.dot(point.global_transform.basis.z)
                 if vector < -0.8 and point != currentPoint:
@@ -656,15 +824,16 @@ func _has_cover_point_candidate() -> bool:
 func GetShiftWaypoint():
     var validPoints: Array[Node3D]
     var engagement_position = _get_engagement_position()
+    var direction_to_target = (engagement_position - global_position).normalized()
+    var engagement_distance_sq = global_position.distance_squared_to(engagement_position)
 
     if nearbyPoints.size() != 0:
         for point in nearbyPoints:
             if point.is_in_group("AI_WP"):
-                var distanceToAI = global_position.distance_to(point.global_position)
-                var directionToTarget = (engagement_position - global_position).normalized()
-                var directionToPoint = (point.global_position - global_position).normalized()
+                var distance_to_ai_sq = global_position.distance_squared_to(point.global_position)
+                var direction_to_point = (point.global_position - global_position).normalized()
 
-                if directionToPoint.dot(directionToTarget) > 0 and distanceToAI < global_position.distance_to(engagement_position):
+                if direction_to_point.dot(direction_to_target) > 0 and distance_to_ai_sq < engagement_distance_sq:
                     if point != currentPoint:
                         validPoints.append(point)
 
@@ -677,11 +846,11 @@ func GetShiftWaypoint():
     return false
 
 func GetHuntWaypoint():
-    if _is_last_known_location_valid() or _has_active_teammate_player_suppressive_fire():
+    if _is_last_known_location_valid():
         MoveToPoint(_get_engagement_position())
 
 func GetAttackWaypoint():
-    if _is_last_known_location_valid() or _has_active_teammate_player_suppressive_fire():
+    if _is_last_known_location_valid():
         MoveToPoint(_get_engagement_position())
 
 func ChangeState(state):
@@ -735,7 +904,7 @@ func _get_tactics_cycle_scale() -> float:
             return 1.0
 
 func _is_last_known_location_valid() -> bool:
-    if _has_active_teammate_player_suppressive_fire():
+    if _is_suppressive_fire_active():
         return true
 
     var now = Time.get_ticks_msec() / 1000.0
@@ -744,33 +913,95 @@ func _is_last_known_location_valid() -> bool:
         decay_time = SECOND_HAND_VALIDITY_TIME
     return now - _last_known_location_data.timestamp <= decay_time
 
-func _start_teammate_player_suppressive_fire(target_position: Vector3):
-    _teammate_player_suppressive_target_position = target_position
-    _teammate_player_suppressive_fire_until = Time.get_ticks_msec() / 1000.0 + randf_range(
-        TEAMMATE_PLAYER_SUPPRESSIVE_FIRE_MIN_SECONDS,
-        TEAMMATE_PLAYER_SUPPRESSIVE_FIRE_MAX_SECONDS
-    )
+func _suppression_round_budget() -> int:
+    return max(1, _magazine_capacity * SUPPRESSIVE_FIRE_MAGAZINES)
 
-func _clear_teammate_player_suppressive_fire():
-    _teammate_player_suppressive_fire_until = -1.0
-    _teammate_player_suppressive_target_position = Vector3.ZERO
+func _arm_suppressive_fire(target_type: String, target_position: Vector3):
+    if !weaponData:
+        return
+    if weaponData.weaponAction == "Manual":
+        return
+    if target_position == Vector3.ZERO:
+        return
+    if target_type == "player" and !_can_target_player():
+        return
+    if target_type == "ai" and !_has_valid_ai_target():
+        return
 
-func _has_active_teammate_player_suppressive_fire() -> bool:
-    if current_target_type != "player":
-        return false
-    if _teammate_player_suppressive_fire_until < 0.0:
-        return false
-    return (Time.get_ticks_msec() / 1000.0) <= _teammate_player_suppressive_fire_until
+    var is_new_mode = !_suppressive_fire_active or _suppressive_fire_target_type != target_type
+    _suppressive_fire_active = true
+    _suppressive_fire_target_type = target_type
+    _suppressive_fire_target_position = target_position
+    if is_new_mode:
+        _suppressive_fire_rounds_remaining = _suppression_round_budget()
 
-func _should_force_suppressive_player_fire() -> bool:
-    if !_has_active_teammate_player_suppressive_fire():
+func _update_suppressive_target_position(target_position: Vector3):
+    if !_suppressive_fire_active:
+        return
+    if target_position == Vector3.ZERO:
+        return
+    _suppressive_fire_target_position = target_position
+
+func _clear_suppressive_fire():
+    _suppressive_fire_active = false
+    _suppressive_fire_target_type = "none"
+    _suppressive_fire_target_position = Vector3.ZERO
+    _suppressive_fire_rounds_remaining = 0
+    _previous_player_visible = false
+
+func _clear_suppressive_fire_for_target(target_type: String):
+    if !_suppressive_fire_active:
+        return
+    if _suppressive_fire_target_type != target_type:
+        return
+    _clear_suppressive_fire()
+
+func _is_suppressive_fire_active() -> bool:
+    if !_suppressive_fire_active:
         return false
-    if !_can_target_player():
+    if _suppressive_fire_rounds_remaining <= 0:
+        _clear_suppressive_fire()
         return false
+    if !weaponData or weaponData.weaponAction == "Manual":
+        _clear_suppressive_fire()
+        return false
+    if _suppressive_fire_target_position == Vector3.ZERO:
+        _clear_suppressive_fire()
+        return false
+
+    if _suppressive_fire_target_type == "player":
+        if current_target_type != "player" or !_can_target_player():
+            _clear_suppressive_fire()
+            return false
+    elif _suppressive_fire_target_type == "ai":
+        if current_target_type != "ai" or !_has_valid_ai_target():
+            _clear_suppressive_fire()
+            return false
+    else:
+        _clear_suppressive_fire()
+        return false
+
     return !_player_only_combat_blocked()
 
+func _consume_suppressive_round():
+    if !_suppressive_fire_active:
+        return
+    _suppressive_fire_rounds_remaining = max(0, _suppressive_fire_rounds_remaining - 1)
+    if _suppressive_fire_rounds_remaining <= 0:
+        _clear_suppressive_fire()
+
+func _update_player_suppressive_visibility_state(is_visible: bool):
+    if is_visible:
+        if !_previous_player_visible and current_target_type == "player":
+            _arm_suppressive_fire("player", playerPosition)
+        elif _suppressive_fire_active and _suppressive_fire_target_type == "player":
+            _update_suppressive_target_position(playerPosition)
+        _previous_player_visible = true
+        return
+    _previous_player_visible = false
+
 func _can_fire_engagement() -> bool:
-    return _engagement_visible() or _should_force_suppressive_player_fire()
+    return _engagement_visible() or _is_suppressive_fire_active()
 
 func Death(direction, force):
     if has_meta("boswar_death_processed"):
@@ -804,17 +1035,228 @@ func Death(direction, force):
             "faction": _self_faction()
         })
 
+func ActivateContainer():
+    super()
+    _apply_bonus_loot_to_container()
+
+func _apply_bonus_loot_to_container():
+    var settings_snapshot = {}
+    if !bool(_loot_setting_cached(settings_snapshot, "loot_enabled", true)):
+        return
+    if !is_instance_valid(container):
+        _loot_log("Skipped bonus loot: missing container")
+        return
+    if container.has_meta("boswar_bonus_loot_applied"):
+        _loot_log("Skipped bonus loot: already applied")
+        return
+
+    var lt_master = container.get("LT_Master")
+    if lt_master == null:
+        _loot_log("Skipped bonus loot: missing LT_Master")
+        return
+
+    var all_items = lt_master.get("items")
+    if typeof(all_items) != TYPE_ARRAY or all_items.size() == 0:
+        _loot_log("Skipped bonus loot: LT_Master items missing")
+        return
+
+    var loot_profile_tag = _loot_profile_tag_for_container(container)
+    var loot_pools = _get_cached_loot_profile_pools(lt_master, all_items, loot_profile_tag)
+    var consumable_common: Array = loot_pools.get("consumable_common", [])
+    var consumable_rare: Array = loot_pools.get("consumable_rare", [])
+    var medical_common: Array = loot_pools.get("medical_common", [])
+    var medical_rare: Array = loot_pools.get("medical_rare", [])
+
+    var can_create_loot = container.has_method("CreateLoot")
+    if !can_create_loot:
+        _loot_log("Skipped item loot: container has no CreateLoot")
+
+    var loot_rolls = max(1, int(_loot_setting_cached(settings_snapshot, "loot_rolls", 3)))
+    var max_consumables = max(0, int(_loot_setting_cached(settings_snapshot, "max_consumables", 2)))
+    var max_medical = max(0, int(_loot_setting_cached(settings_snapshot, "max_medical", 1)))
+    var max_magazines = max(0, int(_loot_setting_cached(settings_snapshot, "max_magazines", 1)))
+    var max_ammo = max(0, int(_loot_setting_cached(settings_snapshot, "max_ammo", 10)))
+    var rare_chance = clamp(float(_loot_setting_cached(settings_snapshot, "rare_chance", 0.25)), 0.0, 1.0)
+
+    var created_food = 0
+    var created_meds = 0
+    var created_magazines = 0
+    var created_ammo = 0
+
+    if can_create_loot:
+        for _pick in _weighted_loot_count(max_consumables, loot_rolls):
+            var consumable_pick = _pick_loot_item(consumable_common, consumable_rare, rare_chance)
+            if consumable_pick == null:
+                continue
+            container.call("CreateLoot", consumable_pick)
+            created_food += 1
+
+        for _pick in _weighted_loot_count(max_medical, loot_rolls):
+            var medical_pick = _pick_loot_item(medical_common, medical_rare, rare_chance)
+            if medical_pick == null:
+                continue
+            container.call("CreateLoot", medical_pick)
+            created_meds += 1
+
+        if weaponData and weaponData.compatible.size() > 0:
+            var magazine_item = weaponData.compatible[0]
+            if magazine_item and magazine_item.subtype == "Magazine":
+                for _pick in _weighted_loot_count(max_magazines, loot_rolls):
+                    container.call("CreateLoot", magazine_item)
+                    created_magazines += 1
+
+    if weaponData and weaponData.ammo:
+        created_ammo = _weighted_loot_count(max_ammo, loot_rolls)
+        if created_ammo > 0:
+            _add_ammo_loot_entry(container, weaponData.ammo, created_ammo)
+
+    container.set_meta("boswar_bonus_loot_applied", true)
+    if container.has_method("SpawnItems"):
+        container.call("SpawnItems")
+
+    _loot_log(
+        "Bonus loot applied food=%d meds=%d magazines=%d ammo=%d" % [
+            created_food,
+            created_meds,
+            created_magazines,
+            created_ammo
+        ]
+    )
+
+func _weighted_loot_count(max_count: int, roll_count: int) -> int:
+    var safe_max = max(0, max_count)
+    var safe_roll_count = max(1, roll_count)
+    var result = randi_range(0, safe_max)
+    for _i in range(safe_roll_count - 1):
+        result = min(result, randi_range(0, safe_max))
+    return result
+
+func _pick_loot_item(common_pool: Array, rare_pool: Array, rare_chance: float):
+    if common_pool.size() == 0 and rare_pool.size() == 0:
+        return null
+
+    var roll = randf()
+    if roll < rare_chance and rare_pool.size() > 0:
+        return rare_pool.pick_random()
+
+    if common_pool.size() > 0:
+        return common_pool.pick_random()
+    if rare_pool.size() > 0:
+        return rare_pool.pick_random()
+    return null
+
+func _add_ammo_loot_entry(target_container: Node3D, ammo_item: ItemData, amount: int):
+    if !is_instance_valid(target_container):
+        return
+    if ammo_item == null or amount <= 0:
+        return
+
+    var loot_array = target_container.get("loot")
+    if typeof(loot_array) != TYPE_ARRAY:
+        _loot_log("Skipped ammo loot: container has no loot array")
+        return
+
+    var ammo_slot = SlotData.new()
+    ammo_slot.itemData = ammo_item
+    ammo_slot.amount = max(1, amount)
+    loot_array.append(ammo_slot)
+    target_container.set("loot", loot_array)
+
+func _loot_profile_tag_for_container(target_container: Node3D) -> String:
+    if bool(target_container.get("military")):
+        return "all"
+    if bool(target_container.get("industrial")):
+        return "industrial"
+    return "civilian"
+
+func _loot_profile_cache_key(lt_master, profile_tag: String) -> String:
+    var lt_master_id = -1
+    if lt_master is Object:
+        lt_master_id = lt_master.get_instance_id()
+    return "%d|%s" % [lt_master_id, profile_tag]
+
+func _get_cached_loot_profile_pools(lt_master, all_items: Array, profile_tag: String) -> Dictionary:
+    var cache_key = _loot_profile_cache_key(lt_master, profile_tag)
+    if _loot_pool_profile_cache.has(cache_key):
+        var cached_entry = _loot_pool_profile_cache[cache_key]
+        if cached_entry is Dictionary and int(cached_entry.get("source_size", -1)) == all_items.size():
+            return cached_entry.get("pools", {})
+
+    var categorized = {
+        "consumable_common": [],
+        "consumable_rare": [],
+        "medical_common": [],
+        "medical_rare": []
+    }
+
+    if typeof(all_items) != TYPE_ARRAY:
+        _loot_pool_profile_cache[cache_key] = {
+            "source_size": -1,
+            "pools": categorized
+        }
+        return categorized
+
+    for item in all_items:
+        if item == null:
+            continue
+
+        if profile_tag == "industrial":
+            if !(item.civilian or item.industrial):
+                continue
+        elif profile_tag != "all":
+            if !item.civilian:
+                continue
+
+        if item.type == "Consumables":
+            if item.rarity == item.Rarity.Common:
+                categorized["consumable_common"].append(item)
+            elif item.rarity == item.Rarity.Rare:
+                categorized["consumable_rare"].append(item)
+        elif item.type == "Medical":
+            if item.rarity == item.Rarity.Common:
+                categorized["medical_common"].append(item)
+            elif item.rarity == item.Rarity.Rare:
+                categorized["medical_rare"].append(item)
+
+    _loot_pool_profile_cache[cache_key] = {
+        "source_size": all_items.size(),
+        "pools": categorized
+    }
+    if _loot_pool_profile_cache.size() > 64:
+        _loot_pool_profile_cache.clear()
+    return categorized
+
+func _loot_setting_cached(settings_snapshot: Dictionary, setting_name: String, fallback):
+    if settings_snapshot.has(setting_name):
+        return settings_snapshot[setting_name]
+    var value = _loot_setting(setting_name, fallback)
+    settings_snapshot[setting_name] = value
+    return value
+
+func _loot_setting(setting_name: String, fallback):
+    if EnemyAISettings == null:
+        return fallback
+    var value = EnemyAISettings.get(setting_name)
+    if value == null:
+        return fallback
+    return value
+
+func _loot_debug_enabled() -> bool:
+    return bool(_loot_setting("loot_debug", false))
+
+func _loot_log(message: String):
+    if !_loot_debug_enabled():
+        return
+    DebugUtils._debug_log("[loot] " + message)
+
 func _custom_ai_targeting_active() -> bool:
     if boss:
         return false
 
-    return _team_targeting_active() or _same_faction_infighting_active() or _faction_warfare_active()
+    return _team_targeting_active() or _faction_warfare_active()
 
 func _team_targeting_active() -> bool:
     return _self_team_id() >= 0
-
-func _same_faction_infighting_active() -> bool:
-    return _same_faction_infighting_enabled(_self_faction())
 
 func _faction_warfare_active() -> bool:
     var faction = _self_faction()
@@ -823,6 +1265,8 @@ func _faction_warfare_active() -> bool:
 func _sense_player_los() -> bool:
     if !_can_target_player():
         playerVisible = false
+        _previous_player_visible = false
+        _clear_suppressive_fire_for_target("player")
         return false
 
     if playerDistance3D <= 200.0:
@@ -832,6 +1276,7 @@ func _sense_player_los() -> bool:
 
         if viewRadius > 0.5:
             LOSCheck(gameData.cameraPosition)
+            _update_player_suppressive_visibility_state(playerVisible)
             if playerVisible and current_target_type == "player" and current_target_quality > QualityTier.VISUAL:
                 current_target_quality = QualityTier.VISUAL
                 _set_target_label()
@@ -840,6 +1285,7 @@ func _sense_player_los() -> bool:
             return playerVisible
 
     playerVisible = false
+    _update_player_suppressive_visibility_state(false)
     return false
 
 
@@ -865,6 +1311,8 @@ func _refresh_player_alignment_state():
 
     playerVisible = false
     is_close_visual_target = false
+    _previous_player_visible = false
+    _clear_suppressive_fire_for_target("player")
 
     if !_has_valid_ai_target():
         targetLabel = "None"
@@ -985,13 +1433,10 @@ func _update_hostile_ai_targeting(delta):
         _clear_shadow_scoring_runtime_state(false)
         _trace_log(
             "targeting_gate_off",
-            "Targeting gate OFF faction=%s team=%d warfare=%s infight(B/G/M)=%s/%s/%s current_target=%s" % [
+            "Targeting gate OFF faction=%s team=%d warfare=%s current_target=%s" % [
                 _self_faction(),
                 _self_team_id(),
                 str(EnemyAISettings.warfare_enabled),
-                str(EnemyAISettings.bandit_infighting_enabled),
-                str(EnemyAISettings.guard_infighting_enabled),
-                str(EnemyAISettings.military_infighting_enabled),
                 current_target_type
             ],
             TRACE_HOSTILITY_COOLDOWN
@@ -1676,6 +2121,7 @@ func _acquire_best_target():
         current_target_type = "player"
         current_target_quality = QualityTier.VISUAL
         playerVisible = true
+        _update_player_suppressive_visibility_state(true)
         _last_known_location_data = {"position": best_position, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
         lastKnownLocation = best_position
         targetLabel = "Player %.1fm %s" % [best_distance, _quality_tier_to_string(QualityTier.VISUAL)]
@@ -1690,7 +2136,7 @@ func _acquire_best_target():
             is_close_visual_target = true
         return "player"
     else:
-        _clear_teammate_player_suppressive_fire()
+        _clear_suppressive_fire()
         var other_team_id = _target_team_id(best_node)
         _trace_log(
             "choose_ai",
@@ -1756,21 +2202,17 @@ func _is_hostile_faction(self_faction: String, other_faction: String, other_node
         return true
 
     if self_faction == other_faction:
-        var same_faction_allowed = _same_faction_targeting_allowed(self_faction, other_node)
-        if !same_faction_allowed and TRACE_VERBOSE:
+        if TRACE_VERBOSE:
             _trace_log(
                 "hostility_same_faction_block",
-                "Reject same-team target faction=%s self_team=%d other_team=%d infight(B/G/M)=%s/%s/%s" % [
+                "Reject same-faction non-hostile target faction=%s self_team=%d other_team=%d" % [
                     self_faction,
                     self_team_id,
-                    other_team_id,
-                    str(EnemyAISettings.bandit_infighting_enabled),
-                    str(EnemyAISettings.guard_infighting_enabled),
-                    str(EnemyAISettings.military_infighting_enabled)
+                    other_team_id
                 ],
                 TRACE_HOSTILITY_COOLDOWN
             )
-        return same_faction_allowed
+        return false
 
     if !_faction_warfare_active():
         _trace_log(
@@ -1787,34 +2229,6 @@ func _is_hostile_faction(self_faction: String, other_faction: String, other_node
         return false
 
     return _is_supported_warfare_faction(self_faction) and _is_supported_warfare_faction(other_faction)
-
-func _same_faction_targeting_allowed(faction: String, other_node: Node3D = null) -> bool:
-    if !_same_faction_infighting_enabled(faction):
-        return false
-    return _is_hostile_team_for_infighting(other_node)
-
-func _same_faction_infighting_enabled(faction: String) -> bool:
-    match faction:
-        "Bandit":
-            return EnemyAISettings.bandit_infighting_enabled
-        "Guard":
-            return EnemyAISettings.guard_infighting_enabled
-        "Military":
-            return EnemyAISettings.military_infighting_enabled
-        _:
-            return false
-
-func _is_hostile_team_for_infighting(other_node: Node3D = null) -> bool:
-    if !is_instance_valid(other_node):
-        return true
-
-    var self_team_id = _self_team_id()
-    var other_team_id = _target_team_id(other_node)
-
-    if self_team_id < 0 or other_team_id < 0:
-        return true
-
-    return self_team_id != other_team_id
 
 func _is_hostile_team_target(other_node: Node3D = null) -> bool:
     if !is_instance_valid(other_node):
@@ -1892,11 +2306,13 @@ func _record_target_visibility_los_sample(target_position: Vector3, raw_visible:
 
 func _update_target_visibility():
     if _has_valid_ai_target():
+        var was_visible = currentAITargetVisible
         var target_id = int(currentAITarget.get_instance_id())
         if _target_visibility_subject_id != target_id:
             _target_visibility_subject_id = target_id
             _reset_target_visibility_hysteresis()
             currentAITargetVisible = false
+            was_visible = false
 
         currentAITargetDistance = global_position.distance_to(currentAITarget.global_position)
         var now_seconds = Time.get_ticks_msec() / 1000.0
@@ -1930,11 +2346,15 @@ func _update_target_visibility():
         previousAITargetVisible = currentAITargetVisible
 
         if currentAITargetVisible:
-            _last_known_location_data = {"position": _get_ai_target_position(), "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
+            _last_known_location_data = {"position": target_position, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
+            if !was_visible and current_target_type == "ai":
+                _arm_suppressive_fire("ai", target_position)
+            elif _suppressive_fire_active and _suppressive_fire_target_type == "ai":
+                _update_suppressive_target_position(target_position)
             if current_target_quality > QualityTier.VISUAL:
                 current_target_quality = QualityTier.VISUAL
                 _set_target_label()
-                _broadcast_target_to_teammates(_get_ai_target_position(), "ai", currentAITarget, QualityTier.VISUAL)
+                _broadcast_target_to_teammates(target_position, "ai", currentAITarget, QualityTier.VISUAL)
                 DebugUtils._debug_log("Upgraded AI target quality to VISUAL for %s" % targetLabel)
             if currentAITargetDistance < TARGET_PRIORITY_DISTANCE:
                 is_close_visual_target = true
@@ -1950,6 +2370,7 @@ func _update_target_visibility():
         targetLabel = "None"
         previousAITargetVisible = false
         is_close_visual_target = false
+        _clear_suppressive_fire_for_target("ai")
 
 func _can_see_ai_target(target_node: Node3D) -> bool:
     if !is_instance_valid(target_node):
@@ -2011,7 +2432,7 @@ func _get_ai_target_position(target_node = null) -> Vector3:
     return target_node.global_position + Vector3(0, 0.8, 0)
 
 func _get_fire_target_position() -> Vector3:
-    if current_target_type == "ai" and _has_valid_ai_target():
+    if current_target_type == "ai" and _has_valid_ai_target() and currentAITargetVisible:
         var torsoPosition = _get_ai_torso_position()
         if torsoPosition != Vector3.ZERO:
             return torsoPosition
@@ -2019,7 +2440,7 @@ func _get_fire_target_position() -> Vector3:
     return _get_engagement_position() + Vector3(0, 1.0, 0)
 
 func _get_spine_target_position() -> Vector3:
-    if current_target_type == "ai" and _has_valid_ai_target():
+    if current_target_type == "ai" and _has_valid_ai_target() and currentAITargetVisible:
         var spineTorsoPosition = _get_ai_spine_torso_position()
         if spineTorsoPosition != Vector3.ZERO:
             return spineTorsoPosition
@@ -2070,11 +2491,14 @@ func _is_ai_root_hit(hitCollider) -> bool:
     return _is_valid_hostile_ai_target(hitCollider)
 
 func _get_engagement_position() -> Vector3:
+    if _is_suppressive_fire_active():
+        return _suppressive_fire_target_position
+
     if current_target_type == "player":
-        if _has_active_teammate_player_suppressive_fire():
-            return _teammate_player_suppressive_target_position
         return _last_known_location_data.position if _is_last_known_location_valid() else playerPosition
     elif _has_valid_ai_target():
+        if !currentAITargetVisible and _is_last_known_location_valid():
+            return _last_known_location_data.position
         return _get_ai_target_position()
     return playerPosition
 
@@ -2105,9 +2529,41 @@ func _player_only_combat_blocked() -> bool:
 func _should_play_player_bullet_audio() -> bool:
     return current_target_type == "player" or _can_target_player()
 
+func _should_play_supersonic_crack_flyby(shot_target_position: Vector3) -> bool:
+    if !_should_play_player_bullet_audio():
+        return false
+    if _get_engagement_distance() <= 50.0:
+        return false
+    if !is_instance_valid(muzzle):
+        return false
+
+    var shot_origin = muzzle.global_position
+    var to_target = shot_target_position - shot_origin
+    var shot_distance = to_target.length()
+    if shot_distance <= 0.01:
+        return false
+
+    var shot_direction = to_target / shot_distance
+    var to_player = playerPosition - shot_origin
+    var projected_distance = to_player.dot(shot_direction)
+    if projected_distance <= 0.0 or projected_distance >= shot_distance:
+        return false
+
+    var closest_point = shot_origin + shot_direction * projected_distance
+    var player_miss_distance = closest_point.distance_to(playerPosition)
+    return player_miss_distance <= AI_SUPERSONIC_CRACK_MAX_FLYBY_DISTANCE
+
+func _supersonic_crack_shot_delay_seconds() -> float:
+    if !is_instance_valid(muzzle):
+        return 0.0
+    var distance_to_player = muzzle.global_position.distance_to(playerPosition)
+    var delay = distance_to_player / AI_SUPERSONIC_CRACK_SOUND_SPEED
+    return clamp(delay, 0.0, AI_SUPERSONIC_CRACK_MAX_DELAY)
+
 func _clear_ai_target(push_status: bool = true):
     _reset_target_visibility_hysteresis()
-    _clear_teammate_player_suppressive_fire()
+    _clear_suppressive_fire()
+    _previous_player_visible = false
     _target_visibility_subject_id = -1
     currentAITarget = null
     currentAITargetVisible = false
@@ -2237,14 +2693,14 @@ func Selector(delta):
 func _get_preferred_hit_targets(hitCollider) -> Array:
     var targets: Array = []
 
-    if is_instance_valid(hitCollider) and hitCollider == currentAITarget:
+    if currentAITargetVisible and is_instance_valid(hitCollider) and hitCollider == currentAITarget:
         var directTorso = _get_ai_torso_position(hitCollider)
         if directTorso != Vector3.ZERO:
             targets.append(directTorso)
         else:
             targets.append(_get_ai_target_position(hitCollider))
 
-    if is_instance_valid(currentAITarget):
+    if currentAITargetVisible and is_instance_valid(currentAITarget):
         var torso = _get_ai_torso_position(currentAITarget)
         if torso != Vector3.ZERO:
             targets.append(torso)
@@ -2371,14 +2827,15 @@ func _apply_queued_teammate_target_info(target_position: Vector3, target_type: S
             _clear_ai_target()
             current_target_type = "player"
             current_target_quality = quality
-            _start_teammate_player_suppressive_fire(target_position)
+            _arm_suppressive_fire("player", target_position)
             if is_audio:
                 targetLabel = "Player %.1fm (%s Q%d)" % [distance, target_type, quality]
             else:
                 targetLabel = "Player (teammate info Q%d)" % quality
             playerVisible = false
+            _update_player_suppressive_visibility_state(false)
         elif is_ai_target and is_instance_valid(target_node):
-            _clear_teammate_player_suppressive_fire()
+            _clear_suppressive_fire()
             currentAITarget = target_node
             current_target_type = "ai"
             current_target_quality = quality
