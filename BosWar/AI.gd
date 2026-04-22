@@ -41,12 +41,17 @@ var lastAISoundReason = ""
 const AI_HEARING_RUN_DISTANCE = 22.0
 const AI_HEARING_WALK_DISTANCE = 8.0
 const AI_HEARING_GUNSHOT_DISTANCE = 60.0
-const TARGET_PRIORITY_DISTANCE = 25.0
+const TARGET_PRIORITY_DISTANCE = 15.0
 const TARGET_SCAN_MAX_DISTANCE = 120.0
 const TARGET_SCAN_MIN_DOT = -0.2
+const TARGET_SCAN_CANDIDATE_BUDGET_MIN = 8
+const TARGET_SCAN_CANDIDATE_BUDGET_MAX = 24
+const TARGET_SCAN_CANDIDATE_RATIO = 0.45
 const AI_GUNSHOT_MEMORY_TIME = 1.25
 const AI_TARGET_VISIBLE_GAIN_CONFIRM_SECONDS = 0.06
 const AI_TARGET_VISIBLE_LOST_GRACE_SECONDS = 0.35
+const AI_TARGET_VISIBILITY_MOTION_EPSILON_SQ = 0.04
+const AI_TARGET_VISIBILITY_FORCE_RECHECK_SECONDS = 0.33
 const TRACE_TARGETING_COOLDOWN = 4.0
 const TRACE_HOSTILITY_COOLDOWN = 6.0
 const TRACE_VERBOSE = false
@@ -54,6 +59,11 @@ const THREADED_SCORING_PLAYER_ID = 0
 const TEAMMATE_BROADCAST_RANGE_SQ = 2500.0
 const TEAMMATE_TARGET_VALID_DISTANCE_SQ = 10000.0
 const TEAMMATE_DUPLICATE_POSITION_EPSILON_SQ = 2.25
+const TEAMMATE_INTAKE_PROCESS_BUDGET = 3
+const TEAMMATE_INTAKE_QUEUE_MAX = 24
+const TARGETED_HITBOX_BURST_RESET_SECONDS = 0.35
+const TEAMMATE_PLAYER_SUPPRESSIVE_FIRE_MIN_SECONDS = 15.0
+const TEAMMATE_PLAYER_SUPPRESSIVE_FIRE_MAX_SECONDS = 60.0
 var current_target_type = "none"  # "player", "ai", or "none"
 var current_target_score = 0.0
 var current_target_quality = QualityTier.SECOND_HAND
@@ -85,6 +95,16 @@ var _last_debug_status_target = ""
 var _target_visibility_gain_started_at = -1.0
 var _target_visibility_lost_deadline = -1.0
 var _target_visibility_subject_id = -1
+var _target_visibility_last_self_position = Vector3.ZERO
+var _target_visibility_last_target_position = Vector3.ZERO
+var _target_visibility_last_raw_visible = false
+var _target_visibility_last_los_check_time = -9999.0
+var _target_visibility_has_last_raw_sample = false
+var _target_scan_cursor = 0
+var _pending_teammate_target_queue = []
+var _last_shot_timestamp_seconds = -9999.0
+var _teammate_player_suppressive_fire_until = -1.0
+var _teammate_player_suppressive_target_position = Vector3.ZERO
 
 func Activate():
     if boss:
@@ -157,7 +177,7 @@ func LOSCheck(target: Vector3):
         _last_known_location_data = {"position": playerPosition, "timestamp": Time.get_ticks_msec() / 1000.0, "quality": QualityTier.VISUAL}
         lastKnownLocation = playerPosition
         playerVisible = true
-        if playerDistance3D < 25:
+        if playerDistance3D < TARGET_PRIORITY_DISTANCE:
             is_close_visual_target = true
         else:
             is_close_visual_target = false
@@ -266,7 +286,7 @@ func Decision():
 func Shift(delta):
     shiftTimer += delta
 
-    if _engagement_visible():
+    if _can_fire_engagement():
         Fire(delta)
 
     if shiftTimer > shiftCycle:
@@ -285,7 +305,7 @@ func Shift(delta):
 func Hunt(delta):
     huntTimer += delta
 
-    if _engagement_visible():
+    if _can_fire_engagement():
         Fire(delta)
 
     if huntTimer > huntCycle:
@@ -298,7 +318,7 @@ func Hunt(delta):
 func Attack(delta):
     attackTimer += delta
 
-    if _engagement_visible():
+    if _can_fire_engagement():
         Fire(delta)
 
     if attackTimer > attackCycle:
@@ -306,7 +326,7 @@ func Attack(delta):
         attackTimer = 0.0
 
     if agent.is_target_reached() or agent.is_navigation_finished() or _player_only_combat_blocked():
-        if attackReturn and !_engagement_visible():
+        if attackReturn and !_can_fire_engagement():
             ChangeState("Return")
         else:
             ChangeState("Combat")
@@ -328,7 +348,7 @@ func Return():
 func Combat(delta):
     combatTimer += delta
 
-    if _engagement_visible():
+    if _can_fire_engagement():
         Fire(delta)
 
     if combatTimer > combatCycle or agent.is_target_reached() or agent.is_navigation_finished():
@@ -344,17 +364,23 @@ func Fire(delta):
     if impact or _player_only_combat_blocked():
         return
 
-    if !_is_last_known_location_valid() or _last_known_location_data.position.distance_to(_get_engagement_position()) > 4.0:
+    var suppressive_player_fire = _should_force_suppressive_player_fire()
+    if !suppressive_player_fire and (!_is_last_known_location_valid() or _last_known_location_data.position.distance_to(_get_engagement_position()) > 4.0):
         return
 
     if weaponData.weaponAction == "Semi-Auto":
         Selector(delta)
+    if suppressive_player_fire:
+        fullAuto = true
 
     fireTime -= delta
 
     if fireTime <= 0:
+        var now_seconds = Time.get_ticks_msec() / 1000.0
+        var is_first_shot_in_burst = now_seconds - _last_shot_timestamp_seconds > TARGETED_HITBOX_BURST_RESET_SECONDS
+        _last_shot_timestamp_seconds = now_seconds
         _mark_ai_gunshot()
-        Raycast()
+        Raycast(is_first_shot_in_burst)
         PlayFire()
         PlayTail()
         MuzzleVFX()
@@ -464,7 +490,12 @@ func FireAccuracy() -> Vector3:
 
     return fireDirection + xform * offset
 
-func Raycast():
+func _should_use_targeted_hitbox_damage(is_first_shot_in_burst: bool) -> bool:
+    if is_first_shot_in_burst:
+        return true
+    return _get_engagement_distance() <= TARGET_PRIORITY_DISTANCE
+
+func Raycast(is_first_shot_in_burst: bool = false):
     fire.look_at(FireAccuracy(), Vector3.UP, true)
     fire.force_raycast_update()
 
@@ -474,7 +505,11 @@ func Raycast():
         if hitCollider is Hitbox:
             _apply_damage_to_hitbox(hitCollider, _shot_damage())
         elif _is_ai_root_hit(hitCollider):
-            if !_try_apply_targeted_hitbox_damage(hitCollider):
+            var can_use_targeted_hitbox_damage = _should_use_targeted_hitbox_damage(is_first_shot_in_burst)
+            var targeted_damage_applied = false
+            if can_use_targeted_hitbox_damage:
+                targeted_damage_applied = _try_apply_targeted_hitbox_damage(hitCollider)
+            if !targeted_damage_applied:
                 var rootDamage = _shot_damage()
                 DebugUtils._debug_log("Shot landed via AI root collider=%s treating as torso damage=%.1f target=%s" % [hitCollider.name, rootDamage, targetLabel])
                 hitCollider.WeaponDamage("Torso", rootDamage)
@@ -642,12 +677,12 @@ func GetShiftWaypoint():
     return false
 
 func GetHuntWaypoint():
-    if _is_last_known_location_valid():
-        MoveToPoint(_last_known_location_data.position)
+    if _is_last_known_location_valid() or _has_active_teammate_player_suppressive_fire():
+        MoveToPoint(_get_engagement_position())
 
 func GetAttackWaypoint():
-    if _is_last_known_location_valid():
-        MoveToPoint(_last_known_location_data.position)
+    if _is_last_known_location_valid() or _has_active_teammate_player_suppressive_fire():
+        MoveToPoint(_get_engagement_position())
 
 func ChangeState(state):
     super(state)
@@ -700,11 +735,42 @@ func _get_tactics_cycle_scale() -> float:
             return 1.0
 
 func _is_last_known_location_valid() -> bool:
+    if _has_active_teammate_player_suppressive_fire():
+        return true
+
     var now = Time.get_ticks_msec() / 1000.0
     var decay_time = TARGET_INFO_DECAY_TIME
     if _last_known_location_data.has("quality") and _last_known_location_data.quality == QualityTier.SECOND_HAND:
         decay_time = SECOND_HAND_VALIDITY_TIME
     return now - _last_known_location_data.timestamp <= decay_time
+
+func _start_teammate_player_suppressive_fire(target_position: Vector3):
+    _teammate_player_suppressive_target_position = target_position
+    _teammate_player_suppressive_fire_until = Time.get_ticks_msec() / 1000.0 + randf_range(
+        TEAMMATE_PLAYER_SUPPRESSIVE_FIRE_MIN_SECONDS,
+        TEAMMATE_PLAYER_SUPPRESSIVE_FIRE_MAX_SECONDS
+    )
+
+func _clear_teammate_player_suppressive_fire():
+    _teammate_player_suppressive_fire_until = -1.0
+    _teammate_player_suppressive_target_position = Vector3.ZERO
+
+func _has_active_teammate_player_suppressive_fire() -> bool:
+    if current_target_type != "player":
+        return false
+    if _teammate_player_suppressive_fire_until < 0.0:
+        return false
+    return (Time.get_ticks_msec() / 1000.0) <= _teammate_player_suppressive_fire_until
+
+func _should_force_suppressive_player_fire() -> bool:
+    if !_has_active_teammate_player_suppressive_fire():
+        return false
+    if !_can_target_player():
+        return false
+    return !_player_only_combat_blocked()
+
+func _can_fire_engagement() -> bool:
+    return _engagement_visible() or _should_force_suppressive_player_fire()
 
 func Death(direction, force):
     if has_meta("boswar_death_processed"):
@@ -910,10 +976,12 @@ func _update_hostile_ai_targeting(delta):
         _consume_shadow_scoring_result()
 
     if bool(get("dead")) or bool(get("pause")):
+        _pending_teammate_target_queue.clear()
         _clear_shadow_scoring_runtime_state(false)
         return
 
     if !_custom_ai_targeting_active():
+        _pending_teammate_target_queue.clear()
         _clear_shadow_scoring_runtime_state(false)
         _trace_log(
             "targeting_gate_off",
@@ -943,6 +1011,7 @@ func _update_hostile_ai_targeting(delta):
     targetVisibilityTimer -= delta
     broadcastCooldownPlayer -= delta
     broadcastCooldownAI -= delta
+    _process_pending_teammate_target_info()
 
     var has_valid_ai_target = _has_valid_ai_target()
     if (current_target_type == "none" or !has_valid_ai_target) or targetRefreshTimer <= 0.0:
@@ -1360,6 +1429,17 @@ func _active_ai_count() -> int:
         return int(AISpawner.activeAgents)
     return 0
 
+func _current_target_scan_candidate_budget(candidate_count: int) -> int:
+    if candidate_count <= 0:
+        return 0
+
+    var scaled_budget = int(ceil(float(candidate_count) * TARGET_SCAN_CANDIDATE_RATIO))
+    if current_target_type == "none" or !_has_valid_ai_target():
+        scaled_budget += 4
+    scaled_budget = max(TARGET_SCAN_CANDIDATE_BUDGET_MIN, scaled_budget)
+    scaled_budget = min(TARGET_SCAN_CANDIDATE_BUDGET_MAX, scaled_budget)
+    return min(candidate_count, scaled_budget)
+
 func _sense_ai_audio():
     var audible_target = _find_audible_hostile_target()
     if !is_instance_valid(audible_target):
@@ -1469,10 +1549,20 @@ func _acquire_best_target():
     var los_blocked_candidates = 0
     var visible_hostile_candidates = 0
     var local_agents = -1
+    var scan_budget = 0
 
     if is_instance_valid(AISpawner) and is_instance_valid(AISpawner.agents):
         local_agents = AISpawner.agents.get_child_count()
-        for child in _get_active_agent_candidates():
+        var candidates = _get_active_agent_candidates()
+        var candidate_count = candidates.size()
+        scan_budget = _current_target_scan_candidate_budget(candidate_count)
+        if candidate_count > 0:
+            if _target_scan_cursor >= candidate_count:
+                _target_scan_cursor = 0
+
+        for i in range(scan_budget):
+            var index = (_target_scan_cursor + i) % candidate_count
+            var child = candidates[index]
             scanned_ai += 1
             if !_is_valid_hostile_ai_target(child):
                 continue
@@ -1501,6 +1591,11 @@ func _acquire_best_target():
                 best_ai_position = ai_pos
                 best_ai_distance = ai_dist
                 best_ai_node = child
+
+        if candidate_count > 0:
+            _target_scan_cursor = (_target_scan_cursor + scan_budget) % candidate_count
+        else:
+            _target_scan_cursor = 0
 
     var best_type = ""
     var best_position = Vector3.ZERO
@@ -1595,6 +1690,7 @@ func _acquire_best_target():
             is_close_visual_target = true
         return "player"
     else:
+        _clear_teammate_player_suppressive_fire()
         var other_team_id = _target_team_id(best_node)
         _trace_log(
             "choose_ai",
@@ -1778,6 +1874,22 @@ func _is_valid_teammate_target(target_position: Vector3, target_type: String, ta
     else:
         return false
 
+func _should_refresh_target_visibility_los(now_seconds: float, target_position: Vector3) -> bool:
+    if !_target_visibility_has_last_raw_sample:
+        return true
+    if now_seconds - _target_visibility_last_los_check_time >= AI_TARGET_VISIBILITY_FORCE_RECHECK_SECONDS:
+        return true
+    if global_position.distance_squared_to(_target_visibility_last_self_position) > AI_TARGET_VISIBILITY_MOTION_EPSILON_SQ:
+        return true
+    return target_position.distance_squared_to(_target_visibility_last_target_position) > AI_TARGET_VISIBILITY_MOTION_EPSILON_SQ
+
+func _record_target_visibility_los_sample(target_position: Vector3, raw_visible: bool, now_seconds: float):
+    _target_visibility_has_last_raw_sample = true
+    _target_visibility_last_self_position = global_position
+    _target_visibility_last_target_position = target_position
+    _target_visibility_last_raw_visible = raw_visible
+    _target_visibility_last_los_check_time = now_seconds
+
 func _update_target_visibility():
     if _has_valid_ai_target():
         var target_id = int(currentAITarget.get_instance_id())
@@ -1788,7 +1900,11 @@ func _update_target_visibility():
 
         currentAITargetDistance = global_position.distance_to(currentAITarget.global_position)
         var now_seconds = Time.get_ticks_msec() / 1000.0
-        var raw_visible = _can_see_ai_target(currentAITarget)
+        var target_position = _get_ai_target_position(currentAITarget)
+        var raw_visible = _target_visibility_last_raw_visible
+        if _should_refresh_target_visibility_los(now_seconds, target_position):
+            raw_visible = _can_see_ai_target(currentAITarget)
+            _record_target_visibility_los_sample(target_position, raw_visible, now_seconds)
         if raw_visible:
             _target_visibility_lost_deadline = -1.0
             if currentAITargetVisible:
@@ -1820,7 +1936,7 @@ func _update_target_visibility():
                 _set_target_label()
                 _broadcast_target_to_teammates(_get_ai_target_position(), "ai", currentAITarget, QualityTier.VISUAL)
                 DebugUtils._debug_log("Upgraded AI target quality to VISUAL for %s" % targetLabel)
-            if currentAITargetDistance < 25:
+            if currentAITargetDistance < TARGET_PRIORITY_DISTANCE:
                 is_close_visual_target = true
             else:
                 is_close_visual_target = false
@@ -1955,6 +2071,8 @@ func _is_ai_root_hit(hitCollider) -> bool:
 
 func _get_engagement_position() -> Vector3:
     if current_target_type == "player":
+        if _has_active_teammate_player_suppressive_fire():
+            return _teammate_player_suppressive_target_position
         return _last_known_location_data.position if _is_last_known_location_valid() else playerPosition
     elif _has_valid_ai_target():
         return _get_ai_target_position()
@@ -1989,6 +2107,7 @@ func _should_play_player_bullet_audio() -> bool:
 
 func _clear_ai_target(push_status: bool = true):
     _reset_target_visibility_hysteresis()
+    _clear_teammate_player_suppressive_fire()
     _target_visibility_subject_id = -1
     currentAITarget = null
     currentAITargetVisible = false
@@ -2014,6 +2133,11 @@ func _set_target_label():
 func _reset_target_visibility_hysteresis():
     _target_visibility_gain_started_at = -1.0
     _target_visibility_lost_deadline = -1.0
+    _target_visibility_last_self_position = Vector3.ZERO
+    _target_visibility_last_target_position = Vector3.ZERO
+    _target_visibility_last_raw_visible = false
+    _target_visibility_last_los_check_time = -9999.0
+    _target_visibility_has_last_raw_sample = false
 
 func _self_or_target_faction_name(target_node: Node3D) -> String:
     if is_instance_valid(target_node) and target_node.has_meta("enemy_ai_faction"):
@@ -2176,9 +2300,37 @@ func _broadcast_target_to_teammates(target_position: Vector3, target_type: Strin
         broadcastCooldownAI = 2.0
     _record_teammate_broadcast(target_position, target_type, target_node, quality)
 
+func _process_pending_teammate_target_info():
+    if _pending_teammate_target_queue.is_empty():
+        return
+
+    var max_to_process = min(_pending_teammate_target_queue.size(), TEAMMATE_INTAKE_PROCESS_BUDGET)
+    for _i in range(max_to_process):
+        if _pending_teammate_target_queue.is_empty():
+            return
+        var queued_info = _pending_teammate_target_queue.pop_front()
+        if typeof(queued_info) != TYPE_DICTIONARY:
+            continue
+        var queued_target_position: Vector3 = queued_info.get("position", Vector3.ZERO)
+        var queued_target_type = str(queued_info.get("target_type", ""))
+        var queued_target_node = queued_info.get("target_node", null)
+        var queued_quality = int(queued_info.get("quality", QualityTier.AUDIO))
+        _apply_queued_teammate_target_info(queued_target_position, queued_target_type, queued_target_node, queued_quality)
+
 func _receive_teammate_target_info(target_position: Vector3, target_type: String, target_node: Node3D = null, quality: QualityTier = QualityTier.AUDIO):
-    # Validate target before adopting
-    if not _is_valid_teammate_target(target_position, target_type, target_node):
+    if !_is_valid_teammate_target(target_position, target_type, target_node):
+        return
+    if _pending_teammate_target_queue.size() >= TEAMMATE_INTAKE_QUEUE_MAX:
+        _pending_teammate_target_queue.pop_front()
+    _pending_teammate_target_queue.append({
+        "position": target_position,
+        "target_type": target_type,
+        "target_node": target_node,
+        "quality": int(quality)
+    })
+
+func _apply_queued_teammate_target_info(target_position: Vector3, target_type: String, target_node: Node3D = null, quality: QualityTier = QualityTier.AUDIO):
+    if !_is_valid_teammate_target(target_position, target_type, target_node):
         return
 
     var is_gunshot = target_type in ["audio_player_gunshot", "audio_ai_gunshot"]
@@ -2219,12 +2371,14 @@ func _receive_teammate_target_info(target_position: Vector3, target_type: String
             _clear_ai_target()
             current_target_type = "player"
             current_target_quality = quality
+            _start_teammate_player_suppressive_fire(target_position)
             if is_audio:
                 targetLabel = "Player %.1fm (%s Q%d)" % [distance, target_type, quality]
             else:
                 targetLabel = "Player (teammate info Q%d)" % quality
             playerVisible = false
         elif is_ai_target and is_instance_valid(target_node):
+            _clear_teammate_player_suppressive_fire()
             currentAITarget = target_node
             current_target_type = "ai"
             current_target_quality = quality

@@ -394,7 +394,7 @@ func _get_preset_profile() -> Dictionary:
             }
         _:  # Default/Low intensity - minimal threat
             return {
-                "spawn_limit": 16,        # Max 16 active enemies at once
+                "spawn_limit": 9,        # Max 9 active enemies at once
                 "spawn_pool": 36,        # Total of 32 enemies available to spawn
                 "initial_population": 4, # Start with 8 enemies
                 "spawn_min": 15.0,       # Spawn intervals: 15-75 seconds
@@ -949,8 +949,8 @@ func _get_team_size_for_faction(faction_name: String) -> int:
 
     match faction_name:
         "Bandit":
-            # Bandits spawn in larger groups (3-8) for ambush tactics.
-            return _roll_team_size(EnemyAISettings.bandit_team_size_min, EnemyAISettings.bandit_team_size_max, 8)
+            # Bandits spawn in larger groups (3-5) for ambush tactics.
+            return _roll_team_size(EnemyAISettings.bandit_team_size_min, EnemyAISettings.bandit_team_size_max, 5)
         "Guard":
             # Guards spawn in disciplined pairs/quads (2-4).
             return _roll_team_size(EnemyAISettings.guard_team_size_min, EnemyAISettings.guard_team_size_max, 4)
