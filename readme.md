@@ -1,6 +1,6 @@
 # Bo's War: Advanced Enemy AI Mod for Road to Vostok
 
-[![Godot](https://img.shields.io/badge/Godot-4.x-blue.svg)](https://godotengine.org/)
+[![Godot](https://img.shields.io/badge/Godot-4.6.2-blue.svg)](https://godotengine.org/)
 [![Version](https://img.shields.io/badge/Version-0.0.1-orange.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -67,7 +67,7 @@ road-to-vostok-mod/
 
 ### Prerequisites
 - **Road to Vostok** game installed
-- **Godot 4.x** (for development/modding)
+- **Godot 4.6.2** (for development/modding)
 
 ### Mod Installation
 1. Download the latest release from the [Releases](../../releases) page
@@ -82,7 +82,7 @@ road-to-vostok-mod/
    cd road-to-vostok-mod
    ```
 
-2. Open the project in Godot 4.x:
+2. Open the project in Godot 4.6.2:
    ```bash
    godot --path .
    ```

@@ -15,6 +15,9 @@ This file is the **operational contract** for work in this repo.
 - Base game code snapshot: `Road to Vostok/`
 - Shader work: `realistic shaders/`
 
+## Engine Baseline (Critical)
+- Game/mod baseline engine version: `Godot 4.6.2`.
+
 ### Non-Negotiable Guardrail
 **Never edit files in `./Road to Vostok/`.** Use them as read-only reference only.
 

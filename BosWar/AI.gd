@@ -435,8 +435,8 @@ func Fire(delta):
         recoveryTimer = 0.0
 
         if fullAuto:
-            var impulseX = spineTarget.x - spineData.recoil * 1.1
-            impulseX = clamp(impulseX, -spineData.recoil * 2.2, spineData.recoil * 0.75)
+            var impulseX = spineTarget.x - spineData.recoil * 0.2
+            impulseX = clamp(impulseX, -spineData.recoil * 0.85, spineData.recoil * 0.75)
             var impulseY = spineTarget.y
             var impulseZ = spineTarget.z
             impulseTarget = Vector3(impulseX, impulseY, impulseZ)
@@ -614,7 +614,7 @@ func FireAccuracy() -> Vector3:
     var offset = Vector3(0, 0, 0)
 
     if fullAuto and !boss:
-        spreadMultiplier = 3.0
+        spreadMultiplier = 3.25
 
     if engagement_distance > 50.0 and is_bandit_or_guard:
         long_range_penalty = 1.5 if fullAuto else 1.25

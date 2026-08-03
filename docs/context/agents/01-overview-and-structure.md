@@ -15,6 +15,7 @@ Bo's War Enemy AI guidance defines standards for AI behavior, architecture, and 
 - Reference scripts: `Reference Scripts/`
 - Base game code snapshot: `Road to Vostok/`
 - Shader assets: `realistic shaders/`
+- Engine baseline: `Godot 4.6.2`
 
 ## Critical guardrail
 Never edit files under `Road to Vostok/`; use them for reference only.
